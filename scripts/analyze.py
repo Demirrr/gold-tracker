@@ -130,10 +130,17 @@ def send_telegram(signal_type, price, pct, ma15, ma60, reason, total_rows):
 
 def analyse(force=False):
     init_db()
+
+    # When running manually, always collect a fresh price first
+    if force:
+        import collect_price
+        collect_price.collect()
+
     con = sqlite3.connect(DB_PATH)
 
     try:
         total_rows = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        last_ts = con.execute("SELECT ts FROM prices ORDER BY ts DESC LIMIT 1").fetchone()
         closes = fetch_recent_closes(con, MIN_BARS_NEEDED + 1)
         if len(closes) < MIN_BARS_NEEDED:
             msg = f"Not enough data yet ({len(closes)}/{MIN_BARS_NEEDED} bars)"
@@ -150,6 +157,14 @@ def analyse(force=False):
 
         pct = (price - BUY_PRICE) / BUY_PRICE * 100
 
+        # Warn if last price bar is more than 10 minutes old
+        data_age_warning = ""
+        if last_ts:
+            last_dt = datetime.fromisoformat(last_ts[0].replace("Z", "+00:00"))
+            age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+            if age_min > 10:
+                data_age_warning = f"  ⚠️  Last price bar is {age_min:.0f} min old ({last_ts[0]}) — market may be closed or data is stale\n"
+
         crossed_below = (ma15_prev >= ma60_prev) and (ma15 < ma60)  # bearish crossover
         crossed_above = (ma15_prev <= ma60_prev) and (ma15 > ma60)  # bullish crossover
         above_threshold = pct >= SIGNAL_THRESHOLD_PCT
@@ -162,6 +177,9 @@ def analyse(force=False):
 
         if force:
             pl = (price - BUY_PRICE) * SHARES_HELD
+            if data_age_warning:
+                print(data_age_warning, end="")
+            print(f"  Last bar: {last_ts[0] if last_ts else 'unknown'}")
             print(f"  Price:   {price:.4f} EUR  ({pct:+.2f}% from buy at {BUY_PRICE})")
             print(f"  MA{MA_SHORT_MINUTES}:    {ma15:.4f}")
             print(f"  MA{MA_LONG_MINUTES}:    {ma60:.4f}")
