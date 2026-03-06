@@ -173,22 +173,37 @@ def analyse(force=False):
         signal_type = None
         reasons = []
 
+        # --- SELL logic ---
+        # Only recommend selling if price is ABOVE buy price (otherwise we'd lock in a loss).
+        # A bearish MA crossover below buy price is a "don't buy more" warning, not a sell signal.
         sell_reasons = []
-        if crossed_below:
-            sell_reasons.append(f"MA{MA_SHORT_MINUTES} crossed below MA{MA_LONG_MINUTES} (bearish)")
         if above_threshold:
             sell_reasons.append(f"Price {pct:+.2f}% above buy price — take profit")
+        if crossed_below and price > BUY_PRICE:
+            sell_reasons.append(f"MA{MA_SHORT_MINUTES} crossed below MA{MA_LONG_MINUTES} (bearish momentum)")
 
         if sell_reasons and (force or not in_cooldown(con, "SELL")):
             signal_type = "SELL"
             reasons = sell_reasons
 
+        # --- BUY logic ---
+        # Only recommend buying more on a dip if the MA trend is not strongly bearish.
+        # A bearish MA crossover + price below buy = wait, trend is against you.
         if signal_type is None:
             buy_reasons = []
+            trend_bearish = ma15 < ma60  # short MA below long MA = downtrend
             if crossed_above:
-                buy_reasons.append(f"MA{MA_SHORT_MINUTES} crossed above MA{MA_LONG_MINUTES} (bullish)")
-            if below_threshold:
-                buy_reasons.append(f"Price {pct:+.2f}% below buy price — potential dip buy")
+                buy_reasons.append(f"MA{MA_SHORT_MINUTES} crossed above MA{MA_LONG_MINUTES} (bullish momentum)")
+            if below_threshold and not trend_bearish:
+                buy_reasons.append(f"Price {pct:+.2f}% below buy price — dip while trend is neutral/bullish")
+            elif below_threshold and trend_bearish:
+                # Log it but don't fire an alert — trend is against buying
+                logging.info(
+                    "Dip detected (%.2f%%) but MA trend is bearish (MA15=%.4f < MA60=%.4f) — suppressing BUY signal",
+                    pct, ma15, ma60,
+                )
+                if force:
+                    print(f"\n  ⚠️  Dip of {pct:+.2f}% detected but MA trend is BEARISH — BUY suppressed. Wait for trend to stabilise.")
 
             if buy_reasons and (force or not in_cooldown(con, "BUY")):
                 signal_type = "BUY"
