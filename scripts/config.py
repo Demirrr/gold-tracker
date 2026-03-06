@@ -5,7 +5,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent
 
 # Asset
-TICKER = "SGBS.MI"          # WisdomTree Physical Swiss Gold, Borsa Italiana (EUR)
+TICKER = "SGBS.AS"          # WisdomTree Physical Swiss Gold, Euronext Amsterdam (EUR) ISIN JE00B588CD74
 BUY_PRICE = 426.23           # EUR per share
 SHARES_HELD = 0.234609
 TOTAL_INVESTED = 101.0       # EUR incl. 1€ fee
