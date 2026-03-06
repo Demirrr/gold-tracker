@@ -157,13 +157,28 @@ def analyse(force=False):
 
         pct = (price - BUY_PRICE) / BUY_PRICE * 100
 
-        # Warn if last price bar is more than 10 minutes old
+        # Warn about data staleness — but distinguish between:
+        # - market closed (expected, no warning needed)
+        # - market open but data is >30 min old (genuine problem)
         data_age_warning = ""
         if last_ts:
             last_dt = datetime.fromisoformat(last_ts[0].replace("Z", "+00:00"))
             age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
-            if age_min > 10:
-                data_age_warning = f"  ⚠️  Last price bar is {age_min:.0f} min old ({last_ts[0]}) — market may be closed or data is stale\n"
+            now_utc = datetime.now(timezone.utc)
+            # Euronext Amsterdam: Mon–Fri 08:00–16:30 UTC (09:00–17:30 CET)
+            market_open = (
+                now_utc.weekday() < 5
+                and (8, 0) <= (now_utc.hour, now_utc.minute) <= (16, 30)
+            )
+            if market_open and age_min > 30:
+                data_age_warning = (
+                    f"  ⚠️  Last price bar is {age_min:.0f} min old ({last_ts[0]}) — "
+                    f"data may be stale (yfinance can lag ~15–20 min for low-volume ETFs)\n"
+                )
+            elif not market_open:
+                data_age_warning = (
+                    f"  ℹ️  Market closed. Last bar: {last_ts[0]} ({age_min:.0f} min ago)\n"
+                )
 
         crossed_below = (ma15_prev >= ma60_prev) and (ma15 < ma60)  # bearish crossover
         crossed_above = (ma15_prev <= ma60_prev) and (ma15 > ma60)  # bullish crossover

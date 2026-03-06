@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Fetch latest price for WGLD.MI and store in SQLite."""
+"""Fetch latest prices for SGBS.AS and store any new bars in SQLite."""
 import logging
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import timezone
 
 import yfinance as yf
 
@@ -21,30 +21,34 @@ logging.basicConfig(
 
 def collect():
     init_db()
-    # Fetch last 5 minutes of 1m candles to get the most recent complete bar
-    df = yf.Ticker(TICKER).history(period="1d", interval="2m")
+    # Use period="2d" so we never miss bars around midnight/open boundaries.
+    # Insert ALL returned bars — INSERT OR IGNORE skips duplicates safely.
+    df = yf.Ticker(TICKER).history(period="2d", interval="2m")
     if df.empty:
         logging.warning("No data returned from yfinance for %s", TICKER)
         return
 
-    # Take the latest complete bar
-    row = df.iloc[-1]
-    ts = df.index[-1].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
     con = sqlite3.connect(DB_PATH)
+    inserted = 0
     try:
-        con.execute(
-            """INSERT OR IGNORE INTO prices (ts, open, high, low, close, volume)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (ts, row.Open, row.High, row.Low, row.Close, row.Volume),
-        )
+        for ts, row in df.iterrows():
+            t = ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cur = con.execute(
+                "INSERT OR IGNORE INTO prices (ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?)",
+                (t, row.Open, row.High, row.Low, row.Close, row.Volume),
+            )
+            inserted += cur.rowcount
         con.commit()
-        logging.info("Stored %s close=%.4f", ts, row.Close)
+        latest_ts = df.index[-1].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        logging.info("Inserted %d new bars. Latest: %s close=%.4f", inserted, latest_ts, df.Close.iloc[-1])
     except Exception as exc:
         logging.error("DB insert failed: %s", exc)
     finally:
         con.close()
 
+    return inserted
+
 
 if __name__ == "__main__":
-    collect()
+    n = collect()
+    print(f"Inserted {n} new bar(s)")
