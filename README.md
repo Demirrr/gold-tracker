@@ -41,49 +41,82 @@ gold-tracker/
 
 ## Signal Engines
 
-Two independent strategies run in parallel per instrument. A single combined Telegram message is sent when either engine fires.
+Two independent strategies run in parallel per instrument. One combined Telegram message is sent when either engine fires.
 
-### Engine 1 — Confluence (RSI + MACD + MA)
+### Engine 1 — Confluence (Day-trader, score-based)
 
-Score-based: each condition contributes points; alert fires when score ≥ 2.
+A multi-indicator day-trader engine. Fires when **score ≥ 3** (max 9). Each condition contributes points:
 
 | Condition | Points | Direction |
 |-----------|--------|-----------|
-| MA15 below MA60 (bearish) | +1 | SELL |
-| MA15 above MA60 (bullish) | +1 | BUY |
-| RSI > 65 (overbought) | +1 | SELL |
-| RSI > 75 (strongly overbought) | +2 | SELL |
-| RSI < 35 (oversold) | +1 | BUY |
-| RSI < 25 (strongly oversold) | +2 | BUY |
+| EMA5 < EMA8 < EMA21 — fully bearish | +2 | SELL |
+| EMA5 < EMA8 — short-term bearish | +1 | SELL |
+| EMA5 > EMA8 > EMA21 — fully bullish | +2 | BUY |
+| EMA5 > EMA8 — short-term bullish | +1 | BUY |
+| RSI > 75 — strongly overbought | +2 | SELL |
+| RSI > 65 — overbought | +1 | SELL |
+| RSI < 25 — strongly oversold | +2 | BUY |
+| RSI < 35 — oversold | +1 | BUY |
 | MACD crossed below signal | +1 | SELL |
 | MACD crossed above signal | +1 | BUY |
-| Price ≥ threshold% above entry (and > buy price) | +1 | SELL |
-| Price ≤ threshold% below entry (and MA bullish) | +1 | BUY |
+| Price below session VWAP (bearish context) | +1 | SELL |
+| Price above session VWAP (bullish context) | +1 | BUY |
+| Price crossed below VWAP (fresh cross) | +1 | SELL |
+| Price crossed above VWAP (fresh cross) | +1 | BUY |
+| Price ≥ entry + 1.5× ATR (take-profit target hit) | +1 | SELL |
+| Volume spike (≥ 2× avg) on bearish bar | +1 | SELL (confirms) |
+| Volume spike (≥ 2× avg) on bullish bar | +1 | BUY (confirms) |
 
-**Confidence:** LOW (2 pts) / MEDIUM (3 pts) / HIGH (4+ pts)
+**Confidence:** LOW (score 3) / MEDIUM (score 4) / HIGH (score 5+)
 
-Safety rules:
-- SELL is suppressed if `current_price < buy_price` — never sell at a loss
-- BUY dip is suppressed when MA15 < MA60 — never buy into a downtrend
+**Safety rules:**
+- SELL suppressed if `price < buy_price` — never suggest selling at a loss
+- BUY penalised −1 if EMA fully bearish — don't buy into a downtrend
+
+**New day-trading indicators vs old version:**
+
+| Old | New | Why it's better |
+|-----|-----|-----------------|
+| MA15 / MA60 simple crossover | EMA5 / EMA8 / EMA21 ribbon | EMAs react faster; 3-level ribbon shows trend strength, not just direction |
+| Fixed 1% threshold | ATR-based take-profit | Scales with current volatility — 1% means very different things in calm vs volatile markets |
+| No volume awareness | Volume spike detection | High-volume confirmation separates genuine moves from noise |
+| No intraday anchor | VWAP (session reset) | Institutional benchmark — VWAP side tells you if smart money is buying or selling |
 
 ### Engine 2 — MACD-only
 
-EMA(12) / EMA(26) → MACD line + 9-period signal line.
-Fires on MACD crossover of signal line. More forward-looking than simple MA crossover.
+EMA(12) / EMA(26) → MACD line + 9-period signal line.  
+Fires on MACD crossover of signal line. More forward-looking than EMA ribbon.
+
+### `instruments.json` config keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ema_fast_bars` | 5 | EMA fast period (bars) |
+| `ema_mid_bars` | 8 | EMA mid period (bars) |
+| `ema_slow_bars` | 21 | EMA slow period (bars) |
+| `atr_period_bars` | 14 | ATR period (bars) |
+| `atr_take_profit_mult` | 1.5 | Take-profit = entry + mult × ATR |
+| `volume_lookback_bars` | 20 | Bars used to compute average volume |
+| `volume_spike_mult` | 2.0 | Volume ratio threshold for spike detection |
+| `alert_cooldown_minutes` | 60 | Min gap between same-type signals |
 
 ### Telegram message format
 
 ```
 📊 SIGNAL REPORT — WisdomTree Physical Swiss Gold
 ────────────────────────────────────────
-🔴 CONFLUENCE: SELL [HIGH confidence, score 4/5]
-   MA15 below MA60 (bearish trend) + RSI 72.0 — overbought + price +1.20% above entry — take profit
+🔴 CONFLUENCE: SELL [HIGH confidence, score 6/9]
+   EMA5 < EMA8 < EMA21 (fully bearish) + RSI 72.3 — overbought + Price crossed below VWAP
+   RSI: 72.3  |  MACD: -0.4200  Signal: -0.1800
+   VWAP: 425.123  (price -0.28% from VWAP)
+   ATR: 1.267  |  TP: 428.131  |  SL: 424.329
+   Volume: 3.2× avg
 
 🔴 MACD ENGINE: SELL
    MACD (-0.4200) crossed below signal (-0.1800)
 
-📈 Price: 430.50 EUR (+1.00% from buy at 426.23)
-💰 P/L:   +1.0152 EUR (+0.99%)
+📈 Price: 424.81 EUR (-0.33% from buy at 426.23)
+💰 P/L:   -0.3340 EUR (-0.34%)
 🕐 2026-03-09 09:15 UTC
 ```
 
