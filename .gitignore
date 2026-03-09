@@ -1,0 +1,6 @@
+venv/
+data/gold.db
+logs/
+__pycache__/
+*.pyc
+.env
