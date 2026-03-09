@@ -141,6 +141,57 @@ def compute_volume_ratio(volumes, lookback=20):
     return volumes[-1] / avg if avg > 0 else None
 
 
+def resample_ohlcv(ohlcv, bars_per_candle):
+    """
+    Resample 2-min OHLCV bars into higher-timeframe candles.
+    bars_per_candle: 8 → ~16-min, 30 → 60-min.
+    Includes partial last candle so the most recent price is always represented.
+    """
+    n = len(ohlcv["closes"])
+    if n < 2:
+        return {"opens": [], "highs": [], "lows": [], "closes": [], "volumes": []}
+    result = {"opens": [], "highs": [], "lows": [], "closes": [], "volumes": []}
+    for start in range(0, n, bars_per_candle):
+        end = min(start + bars_per_candle, n)
+        result["opens"].append(ohlcv["opens"][start])
+        result["highs"].append(max(ohlcv["highs"][start:end]))
+        result["lows"].append(min(ohlcv["lows"][start:end]))
+        result["closes"].append(ohlcv["closes"][end - 1])
+        result["volumes"].append(sum(ohlcv["volumes"][start:end]))
+    return result
+
+
+def get_mtf_trend(ohlcv, bars_15m=8, bars_1h=30):
+    """
+    Compute higher-timeframe trends from stored 2-min bars.
+
+    - 15-min: EMA(5) vs EMA(8) on ~16-min candles (needs 9 candles = 72 bars)
+    - 1-hour: last 60-min close vs previous close (needs 2 candles = 60 bars)
+
+    Returns dict with trend_15m, trend_1h ('bullish'/'bearish'/'neutral'),
+    and candle counts.
+    """
+    tf15 = resample_ohlcv(ohlcv, bars_15m)
+    tf1h = resample_ohlcv(ohlcv, bars_1h)
+
+    trend_15m = "neutral"
+    if len(tf15["closes"]) >= 9:
+        e5 = ema(tf15["closes"], 5)[-1]
+        e8 = ema(tf15["closes"], 8)[-1]
+        trend_15m = "bullish" if e5 > e8 else "bearish"
+
+    trend_1h = "neutral"
+    if len(tf1h["closes"]) >= 2:
+        trend_1h = "bullish" if tf1h["closes"][-1] >= tf1h["closes"][-2] else "bearish"
+
+    return {
+        "trend_15m":    trend_15m,
+        "trend_1h":     trend_1h,
+        "candles_15m":  len(tf15["closes"]),
+        "candles_1h":   len(tf1h["closes"]),
+    }
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def fetch_ohlcv(con, instrument_id, n):
@@ -215,7 +266,7 @@ def save_signal(con, instrument_id, engine, signal_type, price, reason,
 
 # ── Signal engines ────────────────────────────────────────────────────────────
 
-def engine_confluence(ohlcv, session_ohlcv, inst, pct):
+def engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=None):
     """
     Day-trader confluence engine.
 
@@ -230,6 +281,12 @@ def engine_confluence(ohlcv, session_ohlcv, inst, pct):
       Volume spike confirmation  +1  (only if same direction signal already > 0)
 
     Fires when score >= 3.
+
+    Hard gates (suppress signal entirely):
+      - MTF gate: SELL suppressed if both 15-min AND 1-hour trend are bullish.
+                  BUY  suppressed if both 15-min AND 1-hour trend are bearish.
+      - Volume gate: signal suppressed if volume < volume_min_mult (default 0.8×).
+
     Safety: SELL suppressed if price < buy_price.
             BUY penalty -1 if EMA fully bearish.
     """
@@ -365,11 +422,41 @@ def engine_confluence(ohlcv, session_ohlcv, inst, pct):
         if score >= 4: return "MEDIUM"
         return "LOW"
 
+    # Determine candidate signal before applying gates
     if sell_score >= 3 and sell_score >= buy_score:
-        return "SELL", sell_reasons, sell_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
-    if buy_score >= 3:
-        return "BUY",  buy_reasons,  buy_score,  rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
-    return None, [], max(sell_score, buy_score), rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
+        candidate_sig     = "SELL"
+        candidate_reasons = sell_reasons
+        candidate_score   = sell_score
+    elif buy_score >= 3:
+        candidate_sig     = "BUY"
+        candidate_reasons = buy_reasons
+        candidate_score   = buy_score
+    else:
+        return None, [], max(sell_score, buy_score), rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
+
+    # ── Hard gate 1: MTF alignment ────────────────────────────────────────────
+    # Suppress if signal trades against BOTH higher timeframes (worst false signals)
+    if mtf is not None:
+        t15 = mtf.get("trend_15m", "neutral")
+        t1h = mtf.get("trend_1h",  "neutral")
+        if candidate_sig == "SELL" and t15 == "bullish" and t1h == "bullish":
+            logging.info("SELL suppressed by MTF gate: both 15m and 1h bullish")
+            return None, [f"⛔ SELL suppressed: counter-trend (15m {t15}, 1h {t1h})"], candidate_score, \
+                   rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
+        if candidate_sig == "BUY" and t15 == "bearish" and t1h == "bearish":
+            logging.info("BUY suppressed by MTF gate: both 15m and 1h bearish")
+            return None, [f"⛔ BUY suppressed: counter-trend (15m {t15}, 1h {t1h})"], candidate_score, \
+                   rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
+
+    # ── Hard gate 2: minimum volume ───────────────────────────────────────────
+    # Signals on near-zero volume are unreliable (thin market, no conviction)
+    vol_min = inst.get("volume_min_mult", 0.8)
+    if vol_ratio is not None and vol_ratio < vol_min:
+        logging.info("%s suppressed by volume gate: %.2f× < %.2f× minimum", candidate_sig, vol_ratio, vol_min)
+        return None, [f"⛔ {candidate_sig} suppressed: low volume ({vol_ratio:.2f}× avg < {vol_min}× minimum)"], \
+               candidate_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
+
+    return candidate_sig, candidate_reasons, candidate_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio
 
 
 def engine_macd_only(closes, inst):
@@ -422,6 +509,10 @@ def send_telegram(inst, price, pct, results):
             lines.append(f"   ATR: {r['atr']:.3f}  |  TP: {tp:.3f}  |  SL: {sl:.3f}")
         if r.get("vol_ratio") is not None:
             lines.append(f"   Volume: {r['vol_ratio']:.1f}× avg")
+        if r.get("mtf"):
+            t15 = r["mtf"].get("trend_15m", "neutral")
+            t1h = r["mtf"].get("trend_1h",  "neutral")
+            lines.append(f"   MTF:   15m {t15.upper()}  |  1h {t1h.upper()}")
         lines.append("")
 
     if buy_price:
@@ -474,7 +565,10 @@ def analyse_instrument(inst, con, force=False):
     buy_price   = inst.get("buy_price")
     cooldown    = inst["alert_cooldown_minutes"]
     ema_slow_n  = inst.get("ema_slow_bars", 21)
-    min_bars    = max(ema_slow_n + 1, 36)  # need ≥36 for MACD(12,26,9)
+    bars_15m    = inst.get("mtf_15m_bars", 8)
+    bars_1h     = inst.get("mtf_1h_bars", 30)
+    # Need ≥36 for MACD(12,26,9), ≥72 for 15-min MTF (9 candles × 8 bars)
+    min_bars    = max(ema_slow_n + 1, 36, 9 * bars_15m)
 
     total_rows = con.execute(
         "SELECT COUNT(*) FROM prices WHERE instrument_id=?", (iid,)
@@ -493,6 +587,9 @@ def analyse_instrument(inst, con, force=False):
     session_open_dt = now_utc.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     session_open_ts = session_open_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     session_ohlcv   = get_session_bars(con, iid, session_open_ts)
+
+    # Multi-timeframe trend (uses the full ohlcv window, not just session)
+    mtf = get_mtf_trend(ohlcv, bars_15m, bars_1h)
 
     if force:
         print(f"\n{'═' * 46}")
@@ -556,10 +653,23 @@ def analyse_instrument(inst, con, force=False):
             vol_str = f"  ⚡ SPIKE {vol_ratio:.1f}×" if vol_ratio >= inst.get("volume_spike_mult", 2.0) else f"  ({vol_ratio:.1f}× avg — normal)"
             print(f"  Volume:    {vol_str}")
         print(f"  Bars:      {total_rows}  |  Session bars: {len(session_ohlcv['closes']) if session_ohlcv else 0}")
+        print(f"")
+        print(f"  ── Multi-timeframe ─────────────────────────────────")
+        t15 = mtf["trend_15m"]
+        t1h = mtf["trend_1h"]
+        c15 = mtf["candles_15m"]
+        c1h = mtf["candles_1h"]
+        t15_icon = "📈" if t15 == "bullish" else ("📉" if t15 == "bearish" else "➡️")
+        t1h_icon = "📈" if t1h == "bullish" else ("📉" if t1h == "bearish" else "➡️")
+        print(f"  15-min:    {t15_icon} {t15.upper():8}  ({c15} candles, EMA5 vs EMA8)")
+        print(f"  1-hour:    {t1h_icon} {t1h.upper():8}  ({c1h} candles, last close vs prev)")
+        vol_min = inst.get("volume_min_mult", 0.8)
+        if vol_ratio is not None and vol_ratio < vol_min:
+            print(f"  ⚠️  Volume gate: {vol_ratio:.2f}× < {vol_min}× minimum — signals would be suppressed")
 
     # Run both engines
     c_sig, c_reasons, c_score, rsi_v, macd_l, macd_s, vwap_v, atr_v, vol_v = \
-        engine_confluence(ohlcv, session_ohlcv, inst, pct)
+        engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=mtf)
     m_sig, m_reason, m_macd_l, m_macd_s = engine_macd_only(closes, inst)
 
     def conf_label(score):
@@ -580,14 +690,19 @@ def analyse_instrument(inst, con, force=False):
             "engine": "confluence", "signal_type": c_sig,
             "reason": reason_str, "confidence": conf_label(c_score), "score": c_score,
             "rsi": rsi_v, "macd_l": macd_l, "macd_s": macd_s,
-            "vwap": vwap_v, "atr": atr_v, "vol_ratio": vol_v,
+            "vwap": vwap_v, "atr": atr_v, "vol_ratio": vol_v, "mtf": mtf,
         })
         if force:
             print(f"\n  ✅ CONFLUENCE: {c_sig} [{conf_label(c_score)}, score {c_score}/9]")
             for r in c_reasons:
                 print(f"     • {r}")
     elif force:
-        print(f"\n  ℹ️  CONFLUENCE: no signal (score={c_score}/9, need ≥3)")
+        if c_score >= 3 and c_reasons:
+            # Signal scored but was suppressed by a gate
+            print(f"\n  ⛔ CONFLUENCE: signal suppressed  (score was {c_score}/9)")
+            print(f"     {c_reasons[0]}")
+        else:
+            print(f"\n  ℹ️  CONFLUENCE: no signal (score={c_score}/9, need ≥3)")
 
     # MACD engine
     if m_sig and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):

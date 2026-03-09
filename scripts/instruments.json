@@ -18,7 +18,10 @@
     "volume_spike_mult": 2.0,
     "alert_cooldown_minutes": 60,
     "market_open_utc": "08:00",
-    "market_close_utc": "16:30"
+    "market_close_utc": "16:30",
+    "mtf_15m_bars": 8,
+    "mtf_1h_bars": 30,
+    "volume_min_mult": 0.8
   },
   {
     "id": "itky-as",
@@ -39,6 +42,9 @@
     "volume_spike_mult": 2.0,
     "alert_cooldown_minutes": 60,
     "market_open_utc": "08:00",
-    "market_close_utc": "16:30"
+    "market_close_utc": "16:30",
+    "mtf_15m_bars": 8,
+    "mtf_1h_bars": 30,
+    "volume_min_mult": 0.8
   }
 ]
