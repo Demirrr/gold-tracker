@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 """
-Analyse stored prices, generate BUY/SELL signals, and trigger Telegram alerts.
+Analyse stored prices per instrument using two independent signal engines:
 
-Signal logic:
-  SELL  → MA15 crosses below MA60  AND/OR  price >= buy_price * (1 + threshold%)
-  BUY   → MA15 crosses above MA60  AND/OR  price <= buy_price * (1 - threshold%)
-  1-hour cooldown per signal type to prevent spam.
+  1. CONFLUENCE — RSI(14) + MACD(12,26,9) + MA crossover + % threshold.
+     Score-based: fires when ≥2 conditions agree. Confidence: LOW/MEDIUM/HIGH.
+
+  2. MACD-ONLY  — MACD line crosses its signal line. More forward-looking,
+     less lag than simple MA crossover.
+
+One combined Telegram message is sent per instrument when either engine fires.
+
+Usage:
+  python analyze.py                    # all instruments, respects cooldown
+  python analyze.py --instrument sgbs-as
+  python analyze.py --force / -f       # bypass cooldown, print live stats
 """
+import argparse
+import json
 import logging
-import sqlite3
+import math
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-from config import (
-    ALERT_COOLDOWN_MINUTES,
-    BUY_PRICE,
-    DB_PATH,
-    LOG_DIR,
-    MA_LONG_MINUTES,
-    MA_SHORT_MINUTES,
-    SHARES_HELD,
-    SIGNAL_THRESHOLD_PCT,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_SCRIPT,
-)
+sys.path.insert(0, str(Path(__file__).parent))
+from config import DB_PATH, LOG_DIR, SCRIPTS_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_SCRIPT
 from init_db import init_db
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,232 +37,396 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# MA windows need at least this many data points (2-min bars)
-MA_SHORT_BARS = MA_SHORT_MINUTES // 2   # 7 bars  ≈ 15 min
-MA_LONG_BARS  = MA_LONG_MINUTES  // 2   # 30 bars ≈ 60 min
-MIN_BARS_NEEDED = MA_LONG_BARS + 1      # need 1 extra for crossover detection
+
+# ── Instrument registry ───────────────────────────────────────────────────────
+
+def load_instruments(instrument_id=None):
+    instruments = json.loads((SCRIPTS_DIR / "instruments.json").read_text())
+    if instrument_id:
+        instruments = [i for i in instruments if i["id"] == instrument_id]
+        if not instruments:
+            raise ValueError(f"Instrument '{instrument_id}' not found")
+    return instruments
 
 
-def fetch_recent_closes(con, n):
+# ── Technical indicators ──────────────────────────────────────────────────────
+
+def ema(values, period):
+    """Exponential moving average."""
+    k = 2 / (period + 1)
+    result = [values[0]]
+    for v in values[1:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+
+def compute_rsi(closes, period=14):
+    """RSI(14) — returns latest RSI value."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    """Returns (macd_line, signal_line, prev_macd, prev_signal)."""
+    if len(closes) < slow + signal:
+        return None, None, None, None
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    return (
+        macd_line[-1], signal_line[-1],
+        macd_line[-2] if len(macd_line) > 1 else None,
+        signal_line[-2] if len(signal_line) > 1 else None,
+    )
+
+
+def compute_ma(closes, period_bars):
+    if len(closes) < period_bars + 1:
+        return None, None
+    current = sum(closes[-period_bars:]) / period_bars
+    prev    = sum(closes[-period_bars - 1:-1]) / period_bars
+    return current, prev
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def fetch_closes(con, instrument_id, n):
     rows = con.execute(
-        "SELECT close FROM prices ORDER BY ts DESC LIMIT ?", (n,)
+        "SELECT close FROM prices WHERE instrument_id=? ORDER BY ts DESC LIMIT ?",
+        (instrument_id, n),
     ).fetchall()
-    return [r[0] for r in reversed(rows)]  # oldest first
+    return [r[0] for r in reversed(rows)]
 
 
-def last_signal_time(con, signal_type):
+def last_signal_ts(con, instrument_id, engine, signal_type):
     row = con.execute(
-        "SELECT ts FROM signals WHERE signal_type=? ORDER BY ts DESC LIMIT 1",
-        (signal_type,),
+        "SELECT ts FROM signals WHERE instrument_id=? AND engine=? AND signal_type=? "
+        "ORDER BY ts DESC LIMIT 1",
+        (instrument_id, engine, signal_type),
     ).fetchone()
     return row[0] if row else None
 
 
-def in_cooldown(con, signal_type):
-    last = last_signal_time(con, signal_type)
+def in_cooldown(con, instrument_id, engine, signal_type, cooldown_minutes):
+    last = last_signal_ts(con, instrument_id, engine, signal_type)
     if not last:
         return False
     last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-    return datetime.now(timezone.utc) - last_dt < timedelta(minutes=ALERT_COOLDOWN_MINUTES)
+    return datetime.now(timezone.utc) - last_dt < timedelta(minutes=cooldown_minutes)
 
 
-def save_signal(con, signal_type, price, reason, ma15, ma60, pct):
+def save_signal(con, instrument_id, engine, signal_type, price, reason,
+                ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     con.execute(
-        """INSERT INTO signals (ts, signal_type, price, reason, ma15, ma60, pct_from_buy)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ts, signal_type, price, reason, ma15, ma60, pct),
+        """INSERT INTO signals
+           (instrument_id, ts, signal_type, engine, price, reason,
+            ma_short, ma_long, rsi, macd_line, macd_signal_line, pct_from_buy, confidence)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (instrument_id, ts, signal_type, engine, price, reason,
+         ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence),
     )
     con.commit()
-    logging.info("Signal saved: %s price=%.4f pct=%.2f%% reason=%s", signal_type, price, pct, reason)
-    return ts
+    logging.info("[%s][%s] Signal: %s price=%.4f pct=%.2f%% conf=%s reason=%s",
+                 instrument_id, engine, signal_type, price, pct or 0, confidence, reason)
 
 
-def send_telegram(signal_type, price, pct, ma15, ma60, reason, total_rows):
+# ── Signal engines ────────────────────────────────────────────────────────────
+
+def engine_confluence(closes, inst, pct):
+    """
+    Score-based engine. Returns (signal_type, reasons, score, rsi_val, macd_l, macd_s).
+    Fires when score >= 2.
+    """
+    short_bars = inst["ma_short_minutes"] // 2
+    long_bars  = inst["ma_long_minutes"]  // 2
+    buy_price  = inst.get("buy_price")
+    threshold  = inst["signal_threshold_pct"]
+
+    ma_short, ma_short_prev = compute_ma(closes, short_bars)
+    ma_long,  ma_long_prev  = compute_ma(closes, long_bars)
+    rsi_val = compute_rsi(closes)
+    macd_l, macd_s, macd_l_prev, macd_s_prev = compute_macd(closes)
+
+    if ma_short is None or ma_long is None:
+        return None, [], 0, None, None, None
+
+    price = closes[-1]
+    crossed_below = ma_short_prev >= ma_long_prev and ma_short < ma_long
+    crossed_above = ma_short_prev <= ma_long_prev and ma_short > ma_long
+    macd_crossed_below = (macd_l_prev is not None and macd_s_prev is not None
+                          and macd_l_prev >= macd_s_prev and macd_l < macd_s)
+    macd_crossed_above = (macd_l_prev is not None and macd_s_prev is not None
+                          and macd_l_prev <= macd_s_prev and macd_l > macd_s)
+
+    sell_score, sell_reasons = 0, []
+    buy_score,  buy_reasons  = 0, []
+
+    # MA trend
+    if ma_short < ma_long:
+        sell_score += 1; sell_reasons.append(f"MA{inst['ma_short_minutes']} below MA{inst['ma_long_minutes']} (bearish trend)")
+    if ma_short > ma_long:
+        buy_score  += 1; buy_reasons.append(f"MA{inst['ma_short_minutes']} above MA{inst['ma_long_minutes']} (bullish trend)")
+
+    # RSI
+    if rsi_val is not None:
+        if rsi_val > 75:
+            sell_score += 2; sell_reasons.append(f"RSI {rsi_val:.1f} — strongly overbought")
+        elif rsi_val > 65:
+            sell_score += 1; sell_reasons.append(f"RSI {rsi_val:.1f} — overbought")
+        elif rsi_val < 25:
+            buy_score  += 2; buy_reasons.append(f"RSI {rsi_val:.1f} — strongly oversold")
+        elif rsi_val < 35:
+            buy_score  += 1; buy_reasons.append(f"RSI {rsi_val:.1f} — oversold")
+
+    # MACD crossover
+    if macd_crossed_below:
+        sell_score += 1; sell_reasons.append("MACD crossed below signal line (bearish)")
+    if macd_crossed_above:
+        buy_score  += 1; buy_reasons.append("MACD crossed above signal line (bullish)")
+
+    # Price vs buy threshold (only if we have a position)
+    if buy_price and pct is not None:
+        if pct >= threshold and price > buy_price:
+            sell_score += 1; sell_reasons.append(f"Price {pct:+.2f}% above entry — take profit")
+        if pct <= -threshold:
+            if ma_short >= ma_long:  # don't recommend buying into downtrend
+                buy_score += 1; buy_reasons.append(f"Price {pct:+.2f}% below entry — dip opportunity")
+
+    def confidence(score):
+        if score >= 4: return "HIGH"
+        if score >= 3: return "MEDIUM"
+        return "LOW"
+
+    if sell_score >= 2 and sell_score >= buy_score:
+        return "SELL", sell_reasons, sell_score, rsi_val, macd_l, macd_s
+    if buy_score >= 2:
+        return "BUY", buy_reasons, buy_score, rsi_val, macd_l, macd_s
+    return None, [], max(sell_score, buy_score), rsi_val, macd_l, macd_s
+
+
+def engine_macd_only(closes, inst):
+    """
+    Pure MACD crossover engine.
+    Returns (signal_type, reason, macd_l, macd_s).
+    """
+    macd_l, macd_s, macd_l_prev, macd_s_prev = compute_macd(closes)
+    if macd_l is None or macd_l_prev is None:
+        return None, None, None, None
+
+    if macd_l_prev >= macd_s_prev and macd_l < macd_s:
+        return "SELL", f"MACD ({macd_l:.4f}) crossed below signal ({macd_s:.4f})", macd_l, macd_s
+    if macd_l_prev <= macd_s_prev and macd_l > macd_s:
+        return "BUY",  f"MACD ({macd_l:.4f}) crossed above signal ({macd_s:.4f})", macd_l, macd_s
+    return None, None, macd_l, macd_s
+
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+
+def send_telegram(inst, price, pct, results):
+    """
+    results = list of dicts with engine result data.
+    Sends one combined message per instrument.
+    """
     if not TELEGRAM_BOT_TOKEN:
-        logging.warning("TELEGRAM_BOT_TOKEN not set, skipping notification")
+        logging.warning("TELEGRAM_BOT_TOKEN not set, skipping")
         return
 
-    pl        = (price - BUY_PRICE) * SHARES_HELD
-    pl_pct    = (price / BUY_PRICE - 1) * 100
-    pl_sign   = "+" if pl >= 0 else ""
-    pct_sign  = "+" if pct >= 0 else ""
-    trend     = "above" if ma15 > ma60 else "below"
+    name      = inst["name"]
+    buy_price = inst.get("buy_price")
+    shares    = inst.get("shares_held", 0)
+    currency  = inst.get("currency", "EUR")
+    pct_sign  = "+" if (pct or 0) >= 0 else ""
 
-    if signal_type == "SELL":
-        action_line = (
-            "Consider SELLING your position to lock in gains.\n"
-            f"   Selling now at {price:.2f}€ would give you ~{BUY_PRICE + pl/SHARES_HELD:.2f}€/share."
-        )
-        emoji = "🔴"
+    lines = [f"📊 SIGNAL REPORT — {name}", "─" * 36]
+
+    for r in results:
+        engine_label = "CONFLUENCE" if r["engine"] == "confluence" else "MACD ENGINE"
+        sig  = r["signal_type"]
+        emoji = "🔴" if sig == "SELL" else "🟢"
+        conf_str = f" [{r['confidence']} confidence, score {r.get('score','')}/5]" if r["engine"] == "confluence" else ""
+        lines.append(f"{emoji} {engine_label}: {sig}{conf_str}")
+        lines.append(f"   {r['reason']}")
+        if r.get("rsi") is not None:
+            lines.append(f"   RSI: {r['rsi']:.1f}  |  MACD: {r.get('macd_l', 0):.4f}  Signal: {r.get('macd_s', 0):.4f}")
+        lines.append("")
+
+    if buy_price:
+        pl = (price - buy_price) * shares
+        pl_pct = (price / buy_price - 1) * 100
+        pl_sign = "+" if pl >= 0 else ""
+        lines.append(f"📈 Price: {price:.2f} {currency}  ({pct_sign}{pct:.2f}% from buy at {buy_price:.2f})")
+        lines.append(f"💰 P/L:   {pl_sign}{pl:.4f} {currency}  ({pl_sign}{pl_pct:.2f}%)")
     else:
-        action_line = (
-            "Consider BUYING more to average down your position.\n"
-            f"   Current price is below your entry of {BUY_PRICE:.2f}€."
-        )
-        emoji = "🟢"
+        lines.append(f"📈 Price: {price:.2f} {currency}  (watch-only — no position yet)")
 
-    msg = (
-        f"{emoji} GOLD SIGNAL: {signal_type}\n"
-        f"{'─' * 28}\n"
-        f"💡 What to do: {action_line}\n\n"
-        f"📌 Why: {reason}\n\n"
-        f"📈 Price now:  {price:.2f} EUR  ({pct_sign}{pct:.2f}% from your buy at {BUY_PRICE:.2f})\n"
-        f"💰 Your P/L:  {pl_sign}{pl:.4f} EUR  ({pl_sign}{pl_pct:.2f}%)\n"
-        f"📊 MA{MA_SHORT_MINUTES} vs MA{MA_LONG_MINUTES}: {ma15:.2f} vs {ma60:.2f}  "
-        f"(short MA is {trend} long MA)\n"
-        f"📦 Data points: {total_rows} price bars collected\n"
-        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-    )
+    lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
 
+    msg = "\n".join(lines)
     try:
         env = os.environ.copy()
         env["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
-        subprocess.run(
-            ["bash", str(TELEGRAM_SCRIPT), msg],
-            env=env,
-            check=True,
-            capture_output=True,
-        )
-        logging.info("Telegram notification sent for %s", signal_type)
+        subprocess.run(["bash", str(TELEGRAM_SCRIPT), msg], env=env, check=True, capture_output=True)
+        logging.info("[%s] Telegram sent", inst["id"])
     except subprocess.CalledProcessError as exc:
-        logging.error("Telegram send failed: %s", exc.stderr)
+        logging.error("[%s] Telegram failed: %s", inst["id"], exc.stderr)
 
 
-def analyse(force=False):
+# ── Data staleness helper ─────────────────────────────────────────────────────
+
+def staleness_warning(last_ts_str, inst):
+    if not last_ts_str:
+        return "  ⚠️  No price data in DB\n"
+    last_dt = datetime.fromisoformat(last_ts_str.replace("Z", "+00:00"))
+    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+    now_utc = datetime.now(timezone.utc)
+    open_h, open_m   = map(int, inst["market_open_utc"].split(":"))
+    close_h, close_m = map(int, inst["market_close_utc"].split(":"))
+    market_open = (
+        now_utc.weekday() < 5
+        and (open_h, open_m) <= (now_utc.hour, now_utc.minute) <= (close_h, close_m)
+    )
+    if market_open and age_min > 30:
+        return (f"  ⚠️  Last bar is {age_min:.0f} min old ({last_ts_str}) — "
+                f"data may be stale (yfinance lags ~15–20 min for low-volume ETFs)\n")
+    if not market_open:
+        return f"  ℹ️  Market closed. Last bar: {last_ts_str} ({age_min:.0f} min ago)\n"
+    return ""
+
+
+# ── Main per-instrument analysis ──────────────────────────────────────────────
+
+def analyse_instrument(inst, con, force=False):
+    iid       = inst["id"]
+    buy_price = inst.get("buy_price")
+    cooldown  = inst["alert_cooldown_minutes"]
+    short_bars = inst["ma_short_minutes"] // 2
+    long_bars  = inst["ma_long_minutes"]  // 2
+    # Need enough bars for MACD(12,26,9) + 1 prev: 26+9+1 = 36 bars minimum
+    min_bars = max(long_bars + 1, 36)
+
+    total_rows = con.execute(
+        "SELECT COUNT(*) FROM prices WHERE instrument_id=?", (iid,)
+    ).fetchone()[0]
+    last_ts = con.execute(
+        "SELECT ts FROM prices WHERE instrument_id=? ORDER BY ts DESC LIMIT 1", (iid,)
+    ).fetchone()
+    last_ts_str = last_ts[0] if last_ts else None
+
+    closes = fetch_closes(con, iid, min_bars + 1)
+
+    if force:
+        print(f"\n{'═'*42}")
+        print(f"  Instrument: {inst['name']} ({iid})")
+        print(staleness_warning(last_ts_str, inst), end="")
+
+    if len(closes) < min_bars:
+        msg = f"  [{iid}] Not enough data ({len(closes)}/{min_bars} bars needed)"
+        logging.info(msg)
+        if force: print(msg)
+        return
+
+    price = closes[-1]
+    pct   = ((price - buy_price) / buy_price * 100) if buy_price else None
+
+    if force:
+        print(f"  Last bar:  {last_ts_str}")
+        print(f"  Price:     {price:.4f} {inst['currency']}"
+              + (f"  ({pct:+.2f}% from buy at {buy_price})" if pct is not None else "  (watch-only)"))
+        rsi_val = compute_rsi(closes)
+        macd_l, macd_s, _, _ = compute_macd(closes)
+        ma_s, _ = compute_ma(closes, short_bars)
+        ma_l, _ = compute_ma(closes, long_bars)
+        print(f"  MA{inst['ma_short_minutes']}:      {ma_s:.4f}  |  MA{inst['ma_long_minutes']}:  {ma_l:.4f}")
+        print(f"  RSI(14):   {rsi_val:.2f}" if rsi_val else "  RSI(14):   n/a")
+        print(f"  MACD:      {macd_l:.4f}  |  Signal: {macd_s:.4f}" if macd_l else "  MACD:      n/a")
+        print(f"  Bars:      {total_rows}")
+
+    # Run both engines
+    c_sig, c_reasons, c_score, rsi_v, macd_l, macd_s = engine_confluence(closes, inst, pct)
+    m_sig, m_reason, m_macd_l, m_macd_s = engine_macd_only(closes, inst)
+
+    def conf_label(score):
+        if score >= 4: return "HIGH"
+        if score >= 3: return "MEDIUM"
+        return "LOW"
+
+    telegram_results = []
+
+    # Confluence engine
+    if c_sig and (force or not in_cooldown(con, iid, "confluence", c_sig, cooldown)):
+        reason_str = " + ".join(c_reasons)
+        save_signal(con, iid, "confluence", c_sig, price, reason_str,
+                    compute_ma(closes, short_bars)[0], compute_ma(closes, long_bars)[0],
+                    rsi_v, macd_l, macd_s, pct, conf_label(c_score))
+        telegram_results.append({
+            "engine": "confluence", "signal_type": c_sig,
+            "reason": reason_str, "confidence": conf_label(c_score),
+            "score": c_score, "rsi": rsi_v, "macd_l": macd_l, "macd_s": macd_s,
+        })
+        if force:
+            print(f"\n  ✅ CONFLUENCE: {c_sig} [{conf_label(c_score)}, score {c_score}]")
+            print(f"     {reason_str}")
+    elif force:
+        print(f"\n  ℹ️  CONFLUENCE: no signal (score={c_score}/5, "
+              f"cooldown={in_cooldown(con, iid, 'confluence', 'SELL', cooldown) or in_cooldown(con, iid, 'confluence', 'BUY', cooldown)})")
+
+    # MACD engine
+    if m_sig and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
+        save_signal(con, iid, "macd", m_sig, price, m_reason,
+                    compute_ma(closes, short_bars)[0], compute_ma(closes, long_bars)[0],
+                    rsi_v, m_macd_l, m_macd_s, pct, None)
+        telegram_results.append({
+            "engine": "macd", "signal_type": m_sig,
+            "reason": m_reason, "macd_l": m_macd_l, "macd_s": m_macd_s,
+        })
+        if force:
+            print(f"  ✅ MACD ENGINE: {m_sig}")
+            print(f"     {m_reason}")
+    elif force:
+        macd_l_v, macd_s_v, _, _ = compute_macd(closes)
+        print(f"  ℹ️  MACD ENGINE: no crossover "
+              + (f"(MACD={macd_l_v:.4f}, Signal={macd_s_v:.4f})" if macd_l_v else "(insufficient data)"))
+
+    if telegram_results:
+        send_telegram(inst, price, pct or 0, telegram_results)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def analyse(instrument_id=None, force=False):
     init_db()
-
-    # When running manually, always collect a fresh price first
     if force:
         import collect_price
-        collect_price.collect()
+        collect_price.collect(instrument_id)
 
+    instruments = load_instruments(instrument_id)
     con = sqlite3.connect(DB_PATH)
-
     try:
-        total_rows = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-        last_ts = con.execute("SELECT ts FROM prices ORDER BY ts DESC LIMIT 1").fetchone()
-        closes = fetch_recent_closes(con, MIN_BARS_NEEDED + 1)
-        if len(closes) < MIN_BARS_NEEDED:
-            msg = f"Not enough data yet ({len(closes)}/{MIN_BARS_NEEDED} bars)"
-            logging.info(msg)
-            if force:
-                print(msg)
-            return
-
-        price    = closes[-1]
-        ma15     = sum(closes[-MA_SHORT_BARS:]) / MA_SHORT_BARS
-        ma60     = sum(closes[-MA_LONG_BARS:])  / MA_LONG_BARS
-        ma15_prev = sum(closes[-MA_SHORT_BARS-1:-1]) / MA_SHORT_BARS
-        ma60_prev = sum(closes[-MA_LONG_BARS-1:-1])  / MA_LONG_BARS
-
-        pct = (price - BUY_PRICE) / BUY_PRICE * 100
-
-        # Warn about data staleness — but distinguish between:
-        # - market closed (expected, no warning needed)
-        # - market open but data is >30 min old (genuine problem)
-        data_age_warning = ""
-        if last_ts:
-            last_dt = datetime.fromisoformat(last_ts[0].replace("Z", "+00:00"))
-            age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
-            now_utc = datetime.now(timezone.utc)
-            # Euronext Amsterdam: Mon–Fri 08:00–16:30 UTC (09:00–17:30 CET)
-            market_open = (
-                now_utc.weekday() < 5
-                and (8, 0) <= (now_utc.hour, now_utc.minute) <= (16, 30)
-            )
-            if market_open and age_min > 30:
-                data_age_warning = (
-                    f"  ⚠️  Last price bar is {age_min:.0f} min old ({last_ts[0]}) — "
-                    f"data may be stale (yfinance can lag ~15–20 min for low-volume ETFs)\n"
-                )
-            elif not market_open:
-                data_age_warning = (
-                    f"  ℹ️  Market closed. Last bar: {last_ts[0]} ({age_min:.0f} min ago)\n"
-                )
-
-        crossed_below = (ma15_prev >= ma60_prev) and (ma15 < ma60)  # bearish crossover
-        crossed_above = (ma15_prev <= ma60_prev) and (ma15 > ma60)  # bullish crossover
-        above_threshold = pct >= SIGNAL_THRESHOLD_PCT
-        below_threshold = pct <= -SIGNAL_THRESHOLD_PCT
-
-        logging.info(
-            "price=%.4f ma15=%.4f ma60=%.4f pct=%.2f%% cross_below=%s cross_above=%s",
-            price, ma15, ma60, pct, crossed_below, crossed_above,
-        )
-
-        if force:
-            pl = (price - BUY_PRICE) * SHARES_HELD
-            if data_age_warning:
-                print(data_age_warning, end="")
-            print(f"  Last bar: {last_ts[0] if last_ts else 'unknown'}")
-            print(f"  Price:   {price:.4f} EUR  ({pct:+.2f}% from buy at {BUY_PRICE})")
-            print(f"  MA{MA_SHORT_MINUTES}:    {ma15:.4f}")
-            print(f"  MA{MA_LONG_MINUTES}:    {ma60:.4f}")
-            print(f"  P/L:     {pl:+.4f} EUR")
-            print(f"  Bars:    {total_rows}")
-            print(f"  Crossed below: {crossed_below} | Crossed above: {crossed_above}")
-            print(f"  Above threshold: {above_threshold} | Below threshold: {below_threshold}")
-
-        signal_type = None
-        reasons = []
-
-        # --- SELL logic ---
-        # Only recommend selling if price is ABOVE buy price (otherwise we'd lock in a loss).
-        # A bearish MA crossover below buy price is a "don't buy more" warning, not a sell signal.
-        sell_reasons = []
-        if above_threshold:
-            sell_reasons.append(f"Price {pct:+.2f}% above buy price — take profit")
-        if crossed_below and price > BUY_PRICE:
-            sell_reasons.append(f"MA{MA_SHORT_MINUTES} crossed below MA{MA_LONG_MINUTES} (bearish momentum)")
-
-        if sell_reasons and (force or not in_cooldown(con, "SELL")):
-            signal_type = "SELL"
-            reasons = sell_reasons
-
-        # --- BUY logic ---
-        # Only recommend buying more on a dip if the MA trend is not strongly bearish.
-        # A bearish MA crossover + price below buy = wait, trend is against you.
-        if signal_type is None:
-            buy_reasons = []
-            trend_bearish = ma15 < ma60  # short MA below long MA = downtrend
-            if crossed_above:
-                buy_reasons.append(f"MA{MA_SHORT_MINUTES} crossed above MA{MA_LONG_MINUTES} (bullish momentum)")
-            if below_threshold and not trend_bearish:
-                buy_reasons.append(f"Price {pct:+.2f}% below buy price — dip while trend is neutral/bullish")
-            elif below_threshold and trend_bearish:
-                # Log it but don't fire an alert — trend is against buying
-                logging.info(
-                    "Dip detected (%.2f%%) but MA trend is bearish (MA15=%.4f < MA60=%.4f) — suppressing BUY signal",
-                    pct, ma15, ma60,
-                )
-                if force:
-                    print(f"\n  ⚠️  Dip of {pct:+.2f}% detected but MA trend is BEARISH — BUY suppressed. Wait for trend to stabilise.")
-
-            if buy_reasons and (force or not in_cooldown(con, "BUY")):
-                signal_type = "BUY"
-                reasons = buy_reasons
-
-        if signal_type:
-            reason_str = " + ".join(reasons)
-            save_signal(con, signal_type, price, reason_str, ma15, ma60, pct)
-            send_telegram(signal_type, price, pct, ma15, ma60, reason_str, total_rows)
-            if force:
-                print(f"\n  ✅ Signal fired: {signal_type} — Telegram sent.")
-        else:
-            if force:
-                cooldown_sell = in_cooldown(con, "SELL")
-                cooldown_buy  = in_cooldown(con, "BUY")
-                print(f"\n  ℹ️  No signal. Cooldown: SELL={cooldown_sell}, BUY={cooldown_buy}")
-                if not sell_reasons and not (crossed_above or below_threshold):
-                    print("  Conditions not met for any signal at this time.")
-
+        for inst in instruments:
+            analyse_instrument(inst, con, force=force)
     finally:
         con.close()
 
 
 if __name__ == "__main__":
-    force = "--force" in sys.argv or "-f" in sys.argv
-    if force:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--instrument", "-i", help="Instrument ID (default: all)")
+    parser.add_argument("--force", "-f", action="store_true",
+                        help="Bypass cooldown, fetch fresh data, print live stats")
+    args = parser.parse_args()
+    if args.force:
         print("=== Manual Analysis Run (cooldown bypassed) ===")
-    analyse(force=force)
+    analyse(args.instrument, args.force)

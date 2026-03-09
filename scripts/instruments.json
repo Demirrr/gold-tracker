@@ -1,0 +1,34 @@
+[
+  {
+    "id": "sgbs-as",
+    "name": "WisdomTree Physical Swiss Gold",
+    "ticker": "SGBS.AS",
+    "isin": "JE00B588CD74",
+    "currency": "EUR",
+    "buy_price": 426.23,
+    "shares_held": 0.234609,
+    "total_invested": 101.0,
+    "signal_threshold_pct": 1.0,
+    "ma_short_minutes": 15,
+    "ma_long_minutes": 60,
+    "alert_cooldown_minutes": 60,
+    "market_open_utc": "08:00",
+    "market_close_utc": "16:30"
+  },
+  {
+    "id": "itky-as",
+    "name": "iShares MSCI Turkey UCITS ETF",
+    "ticker": "ITKY.AS",
+    "isin": "IE00B1FZS574",
+    "currency": "EUR",
+    "buy_price": 15.76,
+    "shares_held": 1.01437,
+    "total_invested": 16.99,
+    "signal_threshold_pct": 1.0,
+    "ma_short_minutes": 15,
+    "ma_long_minutes": 60,
+    "alert_cooldown_minutes": 60,
+    "market_open_utc": "08:00",
+    "market_close_utc": "16:30"
+  }
+]

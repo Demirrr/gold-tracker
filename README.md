@@ -1,257 +1,290 @@
-# Gold Tracker 📈
+# Gold Tracker 📊
 
-Automated trading signal system for **WisdomTree Physical Swiss Gold (SGBS.MI)** that sends Telegram alerts when it's a good time to buy or sell, and tracks whether those signals were accurate over time.
+Automated trading signal system that tracks ETF/ETP prices via yfinance, stores data in SQLite, generates BUY/SELL signals using dual signal engines, and sends Telegram alerts — all running locally on a Raspberry Pi with cron.
 
-## How it works
+---
+
+## Instruments tracked
+
+| # | Name | Ticker | ISIN | Buy price | Shares | Total invested |
+|---|------|--------|------|-----------|--------|----------------|
+| 1 | WisdomTree Physical Swiss Gold | SGBS.AS | JE00B588CD74 | 426.23 EUR | 0.234609 | 101.00 EUR |
+| 2 | iShares MSCI Turkey UCITS ETF | ITKY.AS | IE00B1FZS574 | 15.76 EUR | 1.01437 | 16.75 EUR |
+
+Both on Euronext Amsterdam (EUR). To add a new instrument, edit `scripts/instruments.json` (see [Adding a new instrument](#adding-a-new-instrument) below).
+
+---
+
+## Architecture
 
 ```
-[cron every 2min]         [cron every 2min]              [cron every 5min]
-collect_price.py ──► SQLite (gold.db) ──► analyze.py ──► notify via Telegram
-                                               │
-                                               ▼
-                                      track_outcomes.py
-                                  (fills price_1h/4h/24h,
-                                   marks GOOD/BAD/NEUTRAL)
+gold-tracker/
+├── data/
+│   └── gold.db                  ← SQLite database (prices, signals, outcomes)
+├── logs/
+│   ├── cron.log                 ← cron stdout/stderr
+│   ├── analyzer.log             ← signal engine log
+│   ├── collector.log            ← price collection log
+│   └── outcomes.log             ← outcome tracking log
+├── scripts/
+│   ├── instruments.json         ← instrument registry (config per asset)
+│   ├── config.py                ← system-level config (paths, env vars)
+│   ├── init_db.py               ← creates DB schema
+│   ├── migrate_db.py            ← idempotent DB migration (safe to re-run)
+│   ├── collect_price.py         ← fetch 2-min bars from yfinance → DB
+│   ├── analyze.py               ← dual engine signal analysis + Telegram
+│   └── track_outcomes.py        ← grade past signals (GOOD/BAD/NEUTRAL)
+└── venv/                        ← Python virtual environment
 ```
 
-1. **`collect_price.py`** — Fetches `SGBS.MI` price via yfinance every 2 minutes during market hours and stores OHLCV bars in SQLite.
-2. **`analyze.py`** — Computes MA15 & MA60 moving averages, detects crossovers and ±1% threshold breaches from the buy price, generates BUY/SELL signals and sends Telegram alerts (1-hour cooldown per signal type).
-3. **`track_outcomes.py`** — Runs every 5 minutes and retrospectively fills in the price 1h, 4h, and 24h after each signal was generated. It then automatically labels each signal as **GOOD**, **BAD**, or **NEUTRAL** so you can measure strategy accuracy over time.
+---
+
+## Signal Engines
+
+Two independent strategies run in parallel per instrument. A single combined Telegram message is sent when either engine fires.
+
+### Engine 1 — Confluence (RSI + MACD + MA)
+
+Score-based: each condition contributes points; alert fires when score ≥ 2.
+
+| Condition | Points | Direction |
+|-----------|--------|-----------|
+| MA15 below MA60 (bearish) | +1 | SELL |
+| MA15 above MA60 (bullish) | +1 | BUY |
+| RSI > 65 (overbought) | +1 | SELL |
+| RSI > 75 (strongly overbought) | +2 | SELL |
+| RSI < 35 (oversold) | +1 | BUY |
+| RSI < 25 (strongly oversold) | +2 | BUY |
+| MACD crossed below signal | +1 | SELL |
+| MACD crossed above signal | +1 | BUY |
+| Price ≥ threshold% above entry (and > buy price) | +1 | SELL |
+| Price ≤ threshold% below entry (and MA bullish) | +1 | BUY |
+
+**Confidence:** LOW (2 pts) / MEDIUM (3 pts) / HIGH (4+ pts)
+
+Safety rules:
+- SELL is suppressed if `current_price < buy_price` — never sell at a loss
+- BUY dip is suppressed when MA15 < MA60 — never buy into a downtrend
+
+### Engine 2 — MACD-only
+
+EMA(12) / EMA(26) → MACD line + 9-period signal line.
+Fires on MACD crossover of signal line. More forward-looking than simple MA crossover.
+
+### Telegram message format
+
+```
+📊 SIGNAL REPORT — WisdomTree Physical Swiss Gold
+────────────────────────────────────────
+🔴 CONFLUENCE: SELL [HIGH confidence, score 4/5]
+   MA15 below MA60 (bearish trend) + RSI 72.0 — overbought + price +1.20% above entry — take profit
+
+🔴 MACD ENGINE: SELL
+   MACD (-0.4200) crossed below signal (-0.1800)
+
+📈 Price: 430.50 EUR (+1.00% from buy at 426.23)
+💰 P/L:   +1.0152 EUR (+0.99%)
+🕐 2026-03-09 09:15 UTC
+```
+
+---
 
 ## Setup
+
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/Demirrr/gold-tracker.git
 cd gold-tracker
 python3 -m venv venv
 venv/bin/pip install yfinance pandas
+```
+
+### 2. Environment variables
+
+Add to `~/.bashrc` (or export in shell):
+
+```bash
+export TELEGRAM_BOT_TOKEN="<your-bot-token>"
+export TELEGRAM_CHAT_ID="<your-chat-id>"
+```
+
+> ⚠️ Never commit these values. They are read from environment only.
+
+The `send_telegram_message.sh` script uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from the environment.
+
+### 3. Initialise the database
+
+```bash
 venv/bin/python scripts/init_db.py
 ```
 
-Set your Telegram credentials as environment variables:
+Or run the migration if upgrading from an older single-instrument schema:
+
 ```bash
-export TELEGRAM_BOT_TOKEN=your_bot_token_here
-export TELEGRAM_CHAT_ID=your_chat_id_here
+venv/bin/python scripts/migrate_db.py
 ```
 
-Seed historical data (recommended — provides enough bars for MA accuracy on first run):
+### 4. Seed historical data (first run)
+
 ```bash
-venv/bin/python -c "
-import yfinance as yf, sqlite3
-from scripts.config import DB_PATH, TICKER
-from datetime import timezone
-df = yf.Ticker(TICKER).history(period='7d', interval='2m')
-con = sqlite3.connect(DB_PATH)
-for ts, row in df.iterrows():
-    t = ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    con.execute('INSERT OR IGNORE INTO prices (ts,open,high,low,close,volume) VALUES (?,?,?,?,?,?)',
-                (t, row.Open, row.High, row.Low, row.Close, row.Volume))
-con.commit()
-print(f'Seeded {len(df)} bars')
-"
+venv/bin/python scripts/collect_price.py
 ```
 
-## Cron jobs
+This fetches up to 7 days of 2-minute bars for all instruments.
 
-Add to your crontab (`crontab -e`):
+### 5. Set up cron
+
+```
+crontab -e
+```
+
+Add these lines (with your real token/chat ID):
 
 ```cron
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
+TELEGRAM_BOT_TOKEN=<your-token>
+TELEGRAM_CHAT_ID=<your-chat-id>
 
-# Collect price every 2 minutes on weekdays, market hours (07–15 UTC = 09–17 CET)
-*/2 7-15 * * 1-5 /path/to/gold-tracker/venv/bin/python /path/to/gold-tracker/scripts/collect_price.py >> /path/to/gold-tracker/logs/cron.log 2>&1
+# Collect price every 2 min on weekdays during Euronext hours (08:00–16:30 UTC → 07–15 safe window)
+*/2 7-15 * * 1-5 /path/to/venv/bin/python /path/to/scripts/collect_price.py >> /path/to/logs/cron.log 2>&1
 
-# Analyse and notify (offset by 1 minute so data is fresh)
-1-59/2 7-15 * * 1-5 /path/to/gold-tracker/venv/bin/python /path/to/gold-tracker/scripts/analyze.py >> /path/to/gold-tracker/logs/cron.log 2>&1
+# Analyse 1 min after collect
+1-59/2 7-15 * * 1-5 /path/to/venv/bin/python /path/to/scripts/analyze.py >> /path/to/logs/cron.log 2>&1
 
-# Track outcomes every 5 minutes (all day, to catch 1h/4h/24h windows)
-*/5 * * * * /path/to/gold-tracker/venv/bin/python /path/to/gold-tracker/scripts/track_outcomes.py >> /path/to/gold-tracker/logs/cron.log 2>&1
+# Track outcomes every 5 min
+*/5 * * * * /path/to/venv/bin/python /path/to/scripts/track_outcomes.py >> /path/to/logs/cron.log 2>&1
 ```
 
-## Manual run
+---
 
-Run analysis immediately (bypasses the 1-hour cooldown and prints live stats to stdout):
+## Manual analysis
+
+Run at any time to fetch fresh data and see live stats (bypasses cooldown):
 
 ```bash
 venv/bin/python scripts/analyze.py --force
-# or short form
-venv/bin/python scripts/analyze.py -f
+# or for a single instrument:
+venv/bin/python scripts/analyze.py --force --instrument sgbs-as
 ```
 
-Example output:
-```
-=== Manual Analysis Run (cooldown bypassed) ===
-  Price:   425.67 EUR  (-0.13% from buy at 426.23)
-  MA15:    424.51
-  MA60:    424.08
-  P/L:     -0.13 EUR
-  Bars:    173
-  Crossed below: False | Crossed above: False
-  Above threshold: False | Below threshold: False
-
-  ℹ️  No signal. Cooldown: SELL=False, BUY=False
-  Conditions not met for any signal at this time.
-```
-
-## Signal logic
-
-| Signal | Condition |
-|--------|-----------|
-| 🔴 SELL | MA15 crosses below MA60 (bearish) AND/OR price ≥ buy price + threshold% |
-| 🟢 BUY  | MA15 crosses above MA60 (bullish) AND/OR price ≤ buy price − threshold% |
-
-Both conditions are evaluated independently — a signal fires if **either** triggers. The 1-hour cooldown prevents repeat alerts for the same signal type.
-
-## Configuration
-
-Edit `scripts/config.py`:
-
-```python
-TICKER = "SGBS.MI"          # WisdomTree Physical Swiss Gold, Borsa Italiana (EUR)
-BUY_PRICE = 426.23          # Your entry price in EUR
-SHARES_HELD = 0.234609
-TOTAL_INVESTED = 101.0      # EUR incl. fees
-SIGNAL_THRESHOLD_PCT = 1.0  # % from buy price to trigger price alert
-MA_SHORT_MINUTES = 15
-MA_LONG_MINUTES = 60
-ALERT_COOLDOWN_MINUTES = 60
-```
+---
 
 ## Database schema
 
-All data is stored in SQLite at `data/gold.db` (excluded from git).
-
-### `prices` — raw market data
+### `prices`
 | Column | Type | Description |
 |--------|------|-------------|
-| id | INTEGER | Primary key |
-| ts | TEXT | ISO UTC timestamp (unique) |
-| open, high, low, close | REAL | OHLC prices in EUR |
-| volume | REAL | Trade volume |
+| id | INTEGER PK | |
+| instrument_id | TEXT | e.g. `sgbs-as` |
+| ts | TEXT | UTC ISO timestamp |
+| open/high/low/close | REAL | OHLC |
+| volume | REAL | |
 
-### `signals` — generated trading signals
+Unique constraint on `(instrument_id, ts)`.
+
+### `signals`
 | Column | Type | Description |
 |--------|------|-------------|
-| id | INTEGER | Primary key |
-| ts | TEXT | When signal was generated (UTC) |
-| signal_type | TEXT | `BUY` or `SELL` |
-| price | REAL | Price at signal time |
-| reason | TEXT | Human-readable explanation |
-| ma15, ma60 | REAL | Moving average values at signal time |
-| pct_from_buy | REAL | % change from your entry price |
-| notified_at | TEXT | When Telegram alert was sent (NULL = not sent) |
+| id | INTEGER PK | |
+| instrument_id | TEXT | |
+| ts | TEXT | UTC ISO timestamp |
+| signal_type | TEXT | BUY \| SELL |
+| engine | TEXT | confluence \| macd |
+| price | REAL | price at signal time |
+| reason | TEXT | human-readable explanation |
+| ma_short | REAL | MA15 value |
+| ma_long | REAL | MA60 value |
+| rsi | REAL | RSI(14) value |
+| macd_line | REAL | MACD line value |
+| macd_signal_line | REAL | MACD signal line value |
+| pct_from_buy | REAL | % change from buy price |
+| confidence | TEXT | LOW \| MEDIUM \| HIGH (confluence only) |
+| notified_at | TEXT | when Telegram was sent |
 
-### `outcomes` — was the signal accurate?
+### `outcomes`
 | Column | Type | Description |
 |--------|------|-------------|
-| signal_id | INTEGER | FK → signals.id |
-| price_1h | REAL | Price 1 hour after signal |
-| price_4h | REAL | Price 4 hours after signal |
-| price_24h | REAL | Price 24 hours after signal |
-| outcome | TEXT | `GOOD`, `BAD`, or `NEUTRAL` |
-| filled_at | TEXT | When outcome was recorded |
+| id | INTEGER PK | |
+| signal_id | INTEGER FK | references signals.id |
+| price_1h | REAL | price 1h after signal |
+| price_4h | REAL | price 4h after signal |
+| price_24h | REAL | price 24h after signal |
+| outcome | TEXT | GOOD \| BAD \| NEUTRAL |
+| filled_at | TEXT | when outcome was recorded |
 
-**Outcome logic:**
-- `SELL` signal → **GOOD** if `price_1h < signal_price` (price fell — good call to sell)
-- `BUY` signal → **GOOD** if `price_1h > signal_price` (price rose — good call to buy)
-- Within ±0.1% → **NEUTRAL**
-- Otherwise → **BAD**
+---
 
-## Backtracking — measuring strategy accuracy
+## Backtesting and outcome tracking
 
-To review past signals and their outcomes at any time:
+Every signal is stored in the `signals` table. The `track_outcomes.py` script fills in `price_1h`, `price_4h`, `price_24h` and marks each signal as:
 
-```bash
-venv/bin/python -c "
-import sqlite3
-from scripts.config import DB_PATH
+- **GOOD** — price moved in the direction the signal predicted
+- **BAD** — price moved against the signal
+- **NEUTRAL** — price change < 0.1%
 
-con = sqlite3.connect(DB_PATH)
-
-print('=== ALL SIGNALS WITH OUTCOMES ===')
-rows = con.execute('''
-    SELECT s.ts, s.signal_type, s.price, s.pct_from_buy, s.reason,
-           o.price_1h, o.price_24h, o.outcome
-    FROM signals s
-    LEFT JOIN outcomes o ON o.signal_id = s.id
-    ORDER BY s.ts DESC
-''').fetchall()
-
-for r in rows:
-    ts, sig, price, pct, reason, p1h, p24h, outcome = r
-    print(f'  [{ts}] {sig:4s}  price={price:.2f}  pct={pct:+.2f}%')
-    print(f'         reason:  {reason}')
-    print(f'         1h later: {p1h:.2f if p1h else \"pending\":>7}  24h later: {p24h:.2f if p24h else \"pending\":>7}  outcome={outcome or \"pending\"}')
-    print()
-
-total = len(rows)
-good  = sum(1 for r in rows if r[7] == 'GOOD')
-bad   = sum(1 for r in rows if r[7] == 'BAD')
-print(f'Summary: {total} signals total — {good} GOOD / {bad} BAD / {total-good-bad} pending or neutral')
-"
-```
-
-You can also query specific windows:
+To review signal quality:
 
 ```sql
--- All SELL signals that were good calls
-SELECT s.ts, s.price, o.price_1h, o.outcome
-FROM signals s JOIN outcomes o ON o.signal_id = s.id
-WHERE s.signal_type = 'SELL' AND o.outcome = 'GOOD';
-
--- Overall accuracy rate
-SELECT signal_type,
+-- Hit rate per engine
+SELECT engine, signal_type,
        COUNT(*) AS total,
-       SUM(outcome = 'GOOD') AS good,
-       ROUND(100.0 * SUM(outcome = 'GOOD') / COUNT(*), 1) AS accuracy_pct
-FROM signals s JOIN outcomes o ON o.signal_id = s.id
-GROUP BY signal_type;
+       SUM(CASE WHEN outcome='GOOD' THEN 1 ELSE 0 END) AS good,
+       ROUND(100.0 * SUM(CASE WHEN outcome='GOOD' THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_good
+FROM signals s
+JOIN outcomes o ON o.signal_id = s.id
+GROUP BY engine, signal_type;
+
+-- All signals with outcome
+SELECT s.instrument_id, s.ts, s.signal_type, s.engine,
+       s.price, s.pct_from_buy, s.confidence,
+       o.price_1h, o.outcome
+FROM signals s
+LEFT JOIN outcomes o ON o.signal_id = s.id
+ORDER BY s.ts DESC;
 ```
 
-## Example Telegram alert
+This data lets you evaluate which engine performs better over time and tune thresholds accordingly.
 
+---
+
+## Adding a new instrument
+
+1. Look up the yfinance ticker (Euronext Amsterdam suffix `.AS` recommended for EUR instruments).
+2. Add an entry to `scripts/instruments.json`:
+
+```json
+{
+  "id": "my-etf",
+  "name": "My ETF Name",
+  "ticker": "XYZ.AS",
+  "isin": "...",
+  "currency": "EUR",
+  "buy_price": 100.0,
+  "shares_held": 1.0,
+  "total_invested": 101.0,
+  "signal_threshold_pct": 1.0,
+  "ma_short_minutes": 15,
+  "ma_long_minutes": 60,
+  "alert_cooldown_minutes": 60,
+  "market_open_utc": "08:00",
+  "market_close_utc": "16:30"
+}
 ```
-🔴 GOLD SIGNAL: SELL
-────────────────────────────
-💡 What to do: Consider SELLING your position to lock in gains.
-   Selling now at 430.50€ would give you ~430.50€/share.
 
-📌 Why: Price +1.00% above buy price — take profit
+3. Seed historical data: `venv/bin/python scripts/collect_price.py --instrument my-etf`
+4. No cron changes needed — scripts loop all instruments automatically.
 
-📈 Price now:  430.50 EUR  (+1.00% from your buy at 426.23)
-💰 Your P/L:  +1.00 EUR  (+1.00%)
-📊 MA15 vs MA60: 429.80 vs 428.50  (short MA is above long MA)
-📦 Data points: 250 price bars collected
-🕐 2026-03-05 10:32 UTC
-```
+---
 
 ## Potential improvements
 
-### Strategy enhancements
-- **Multiple strategies in parallel** — run MA crossover, RSI, Bollinger Bands, and MACD as separate strategies simultaneously; only alert when 2+ strategies agree (confluence)
-- **RSI (Relative Strength Index)** — alert when RSI > 70 (overbought → sell) or RSI < 30 (oversold → buy more)
-- **Bollinger Bands** — flag when price touches the upper band (potential reversal) or lower band (potential bounce)
-- **MACD** — detect momentum shifts earlier than simple MA crossovers
-- **Volume confirmation** — only fire signals when volume is above average (stronger conviction)
-- **Trailing stop-loss** — alert if price drops X% from a recent high after a profitable period
-
-### Data & collection
-- **Smaller intervals** — switch to 1-minute bars when more precision is needed (watch yfinance rate limits)
-- **Multiple data sources** — cross-validate price with Alpha Vantage or a broker API to detect yfinance stale data
-- **Pre/post-market awareness** — flag if a significant overnight price gap occurred before market open
-
-### Signal quality
-- **Weighted outcome scoring** — weight 1h outcomes more than 24h; gold can mean-revert over days
-- **Signal confidence score** — combine how many conditions triggered (e.g. MA crossover + threshold breach = higher confidence than either alone)
-- **Avoid choppy markets** — suppress signals when MA15 and MA60 are within 0.1% of each other (sideways market, false crossovers likely)
-
-### Notifications
-- **Telegram inline buttons** — add "I sold ✅" / "I ignored ❌" reply buttons to capture actual user decisions, not just signal outcomes
-- **Daily summary** — send a morning Telegram message with overnight price change, current P/L, and today's MA outlook
-- **Email fallback** — if Telegram fails, send via email
-
-### Infrastructure
-- **Web dashboard** — simple Flask/Streamlit app to visualise price history, signals, and accuracy chart
-- **Alerts on data staleness** — notify if no new price bar has been collected for >10 minutes during market hours (collector may have crashed)
-- **Docker container** — package the whole system for easy deployment on a VPS or Raspberry Pi
+- **More signal engines** — Bollinger Bands mean-reversion, ATR-based volatility stop, Stochastic oscillator
+- **Machine learning** — Train a classifier on labelled outcomes (GOOD/BAD) to weight signal conditions dynamically
+- **Multiple timeframes** — Run daily bars alongside 2-min bars for macro trend confirmation (avoid buying a short-term dip in a long-term downtrend)
+- **Volume analysis** — Filter signals by volume spike confirmation (high volume on crossover = more reliable signal)
+- **Paper trading mode** — Simulate trades with virtual portfolio, compare virtual P/L across strategies before using real money
+- **Web dashboard** — Flask/FastAPI endpoint serving a simple chart of price + signals + outcomes
+- **Push to multiple channels** — Slack, Discord, email in addition to Telegram
+- **Dynamic thresholds** — Auto-tune `signal_threshold_pct` based on recent ATR (Average True Range) to adapt to volatility
+- **Stop-loss alerts** — Alert when P/L drops below a configurable threshold (e.g. -5%) regardless of other signals
+- **Strategy comparison report** — Weekly summary message comparing hit rate of both engines, sent every Monday

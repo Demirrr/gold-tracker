@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize the SQLite database schema."""
+"""Initialize the SQLite database schema (multi-instrument, dual-engine)."""
 import sqlite3
 import sys
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
@@ -12,25 +12,33 @@ def init_db():
 
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS prices (
-        id      INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts      TEXT NOT NULL UNIQUE,   -- ISO UTC timestamp
-        open    REAL,
-        high    REAL,
-        low     REAL,
-        close   REAL NOT NULL,
-        volume  REAL
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_id TEXT    NOT NULL DEFAULT 'sgbs-as',
+        ts            TEXT    NOT NULL,
+        open          REAL,
+        high          REAL,
+        low           REAL,
+        close         REAL    NOT NULL,
+        volume        REAL,
+        UNIQUE(instrument_id, ts)
     );
 
     CREATE TABLE IF NOT EXISTS signals (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts            TEXT NOT NULL,
-        signal_type   TEXT NOT NULL,   -- BUY | SELL | HOLD
-        price         REAL NOT NULL,
-        reason        TEXT,
-        ma15          REAL,
-        ma60          REAL,
-        pct_from_buy  REAL,
-        notified_at   TEXT            -- NULL = not yet sent
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_id    TEXT    NOT NULL DEFAULT 'sgbs-as',
+        ts               TEXT    NOT NULL,
+        signal_type      TEXT    NOT NULL,   -- BUY | SELL
+        engine           TEXT    NOT NULL,   -- confluence | macd
+        price            REAL    NOT NULL,
+        reason           TEXT,
+        ma_short         REAL,
+        ma_long          REAL,
+        rsi              REAL,
+        macd_line        REAL,
+        macd_signal_line REAL,
+        pct_from_buy     REAL,
+        confidence       TEXT,               -- LOW | MEDIUM | HIGH (confluence only)
+        notified_at      TEXT
     );
 
     CREATE TABLE IF NOT EXISTS outcomes (
@@ -39,13 +47,13 @@ def init_db():
         price_1h    REAL,
         price_4h    REAL,
         price_24h   REAL,
-        outcome     TEXT,             -- GOOD | BAD | NEUTRAL
+        outcome     TEXT,
         filled_at   TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_prices_ts   ON prices(ts);
-    CREATE INDEX IF NOT EXISTS idx_signals_ts  ON signals(ts);
-    CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(signal_type);
+    CREATE INDEX IF NOT EXISTS idx_prices_inst_ts   ON prices(instrument_id, ts);
+    CREATE INDEX IF NOT EXISTS idx_signals_inst_ts  ON signals(instrument_id, ts);
+    CREATE INDEX IF NOT EXISTS idx_signals_engine   ON signals(engine);
     """)
 
     con.commit()
