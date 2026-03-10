@@ -41,9 +41,14 @@ def collect_one(inst):
     iid    = inst["id"]
     ticker = inst["ticker"]
 
-    df = yf.Ticker(ticker).history(period="2d", interval="2m")
-    if df.empty:
-        logging.warning("[%s] No data returned from yfinance", iid)
+    try:
+        df = yf.Ticker(ticker).history(period="5d", interval="2m")
+    except Exception as exc:
+        logging.warning("[%s] yfinance fetch failed: %s — skipping", iid, exc)
+        return 0
+
+    if df is None or df.empty:
+        logging.warning("[%s] No data returned from yfinance (market closed or rate-limited)", iid)
         return 0
 
     con = sqlite3.connect(DB_PATH)

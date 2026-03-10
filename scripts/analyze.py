@@ -239,6 +239,34 @@ def last_signal_ts(con, instrument_id, engine, signal_type):
     return row[0] if row else None
 
 
+def last_any_signal_ts(con, instrument_id, engine):
+    """Return the most recent signal timestamp for any signal type from this engine."""
+    row = con.execute(
+        "SELECT ts FROM signals WHERE instrument_id=? AND engine=? "
+        "ORDER BY ts DESC LIMIT 1",
+        (instrument_id, engine),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def has_new_data_since(con, instrument_id, engine):
+    """
+    True if the latest price bar is newer than the last signal from this engine.
+    Prevents re-firing the same stale crossover after cooldown expires.
+    If no previous signal exists, always returns True.
+    """
+    last_sig = last_any_signal_ts(con, instrument_id, engine)
+    if not last_sig:
+        return True
+    latest_bar = con.execute(
+        "SELECT ts FROM prices WHERE instrument_id=? ORDER BY ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+    if not latest_bar:
+        return False
+    return latest_bar[0] > last_sig
+
+
 def in_cooldown(con, instrument_id, engine, signal_type, cooldown_minutes):
     last = last_signal_ts(con, instrument_id, engine, signal_type)
     if not last:
@@ -567,8 +595,9 @@ def analyse_instrument(inst, con, force=False):
     ema_slow_n  = inst.get("ema_slow_bars", 21)
     bars_15m    = inst.get("mtf_15m_bars", 8)
     bars_1h     = inst.get("mtf_1h_bars", 30)
-    # Need ≥36 for MACD(12,26,9), ≥72 for 15-min MTF (9 candles × 8 bars)
-    min_bars    = max(ema_slow_n + 1, 36, 9 * bars_15m)
+    # Minimum bars: need ≥36 for MACD(12,26,9).
+    # MTF gracefully returns "neutral" when not enough candles — don't inflate min_bars for it.
+    min_bars    = max(ema_slow_n + 1, 36)
 
     total_rows = con.execute(
         "SELECT COUNT(*) FROM prices WHERE instrument_id=?", (iid,)
@@ -679,8 +708,9 @@ def analyse_instrument(inst, con, force=False):
 
     telegram_results = []
 
-    # Confluence engine
-    if c_sig and (force or not in_cooldown(con, iid, "confluence", c_sig, cooldown)):
+    # Confluence engine — skip entirely if no new price data since last signal
+    confluence_has_new = force or has_new_data_since(con, iid, "confluence")
+    if c_sig and confluence_has_new and (force or not in_cooldown(con, iid, "confluence", c_sig, cooldown)):
         reason_str = " + ".join(c_reasons)
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
@@ -697,15 +727,18 @@ def analyse_instrument(inst, con, force=False):
             for r in c_reasons:
                 print(f"     • {r}")
     elif force:
-        if c_score >= 3 and c_reasons:
+        if not confluence_has_new:
+            print(f"\n  ℹ️  CONFLUENCE: skipped — no new price data since last signal")
+        elif c_score >= 3 and c_reasons:
             # Signal scored but was suppressed by a gate
             print(f"\n  ⛔ CONFLUENCE: signal suppressed  (score was {c_score}/9)")
             print(f"     {c_reasons[0]}")
         else:
             print(f"\n  ℹ️  CONFLUENCE: no signal (score={c_score}/9, need ≥3)")
 
-    # MACD engine
-    if m_sig and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
+    # MACD engine — skip entirely if no new price data since last signal
+    macd_has_new = force or has_new_data_since(con, iid, "macd")
+    if m_sig and macd_has_new and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
         save_signal(con, iid, "macd", m_sig, price, m_reason,
@@ -718,9 +751,12 @@ def analyse_instrument(inst, con, force=False):
             print(f"  ✅ MACD ENGINE: {m_sig}")
             print(f"     • {m_reason}")
     elif force:
-        ml, ms, _, _ = compute_macd(closes)
-        print(f"  ℹ️  MACD ENGINE: no crossover"
-              + (f" (MACD={ml:.4f}, Signal={ms:.4f})" if ml else " (insufficient data)"))
+        if not macd_has_new:
+            print(f"  ℹ️  MACD ENGINE: skipped — no new price data since last signal")
+        else:
+            ml, ms, _, _ = compute_macd(closes)
+            print(f"  ℹ️  MACD ENGINE: no crossover"
+                  + (f" (MACD={ml:.4f}, Signal={ms:.4f})" if ml else " (insufficient data)"))
 
     if telegram_results:
         send_telegram(inst, price, pct or 0, telegram_results)
