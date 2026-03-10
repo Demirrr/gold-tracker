@@ -84,6 +84,12 @@ def migrate():
     # ── outcomes table ────────────────────────────────────────────────────────
     print("  outcomes: no structural changes needed")
 
+    # ── position sizing columns (added later) ────────────────────────────────
+    for col, col_def in [("suggested_eur", "REAL"), ("suggested_shares", "REAL")]:
+        if not column_exists(cur, "signals", col):
+            print(f"  signals: adding {col}...")
+            cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {col_def}")
+
     con.commit()
     con.close()
     print("Migration complete.")

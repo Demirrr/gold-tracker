@@ -21,7 +21,9 @@
     "market_close_utc": "16:30",
     "mtf_15m_bars": 8,
     "mtf_1h_bars": 30,
-    "volume_min_mult": 0.8
+    "volume_min_mult": 0.8,
+    "max_position_eur": 300.0,
+    "risk_per_trade_pct": 2.0
   },
   {
     "id": "itky-as",
@@ -45,6 +47,8 @@
     "market_close_utc": "16:30",
     "mtf_15m_bars": 8,
     "mtf_1h_bars": 30,
-    "volume_min_mult": 0.8
+    "volume_min_mult": 0.8,
+    "max_position_eur": 100.0,
+    "risk_per_trade_pct": 2.0
   }
 ]

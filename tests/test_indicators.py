@@ -19,6 +19,7 @@ from analyze import (
     compute_volume_ratio,
     resample_ohlcv,
     get_mtf_trend,
+    compute_position_size,
 )
 
 
@@ -352,3 +353,113 @@ class TestMTFTrend:
         mtf    = get_mtf_trend(ohlcv, bars_15m=8, bars_1h=30)
         assert mtf["candles_15m"] == 10   # 80 / 8 = 10 exact
         assert mtf["candles_1h"]  == 3    # 80 / 30 = 2 complete + 1 partial = 3
+
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+
+class TestPositionSizing:
+    """Tests for compute_position_size(signal, confidence_score, price, atr, inst)."""
+
+    BASE_INST = {
+        "buy_price":          426.23,
+        "shares_held":        0.234609,
+        "total_invested":     101.0,
+        "max_position_eur":   300.0,
+        "risk_per_trade_pct": 2.0,
+    }
+
+    def test_high_confidence_buy_larger_than_low(self):
+        inst = dict(self.BASE_INST)
+        eur_high, _, _ = compute_position_size("BUY", 5, 426.0, None, inst)
+        eur_low,  _, _ = compute_position_size("BUY", 3, 426.0, None, inst)
+        assert eur_high > eur_low, "HIGH confidence should suggest more EUR than LOW"
+
+    def test_medium_confidence_buy_between_low_and_high(self):
+        inst = dict(self.BASE_INST)
+        eur_high, _, _ = compute_position_size("BUY", 5, 426.0, None, inst)
+        eur_med,  _, _ = compute_position_size("BUY", 4, 426.0, None, inst)
+        eur_low,  _, _ = compute_position_size("BUY", 3, 426.0, None, inst)
+        assert eur_low < eur_med < eur_high
+
+    def test_atr_cap_reduces_buy_size(self):
+        inst = dict(self.BASE_INST)
+        # Very large ATR (50% of price) — risk cap should kick in
+        eur_no_atr,   _, _ = compute_position_size("BUY", 5, 426.0, None,  inst)
+        eur_huge_atr, _, _ = compute_position_size("BUY", 5, 426.0, 213.0, inst)
+        assert eur_huge_atr < eur_no_atr, "Large ATR must reduce suggested size"
+
+    def test_small_atr_does_not_cap(self):
+        inst = dict(self.BASE_INST)
+        # Tiny ATR (0.1 EUR / 426 = 0.023%) — risk is negligible, cap should not fire
+        eur_no_atr,   _, _ = compute_position_size("BUY", 5, 426.0, None,  inst)
+        eur_small_atr,_, _ = compute_position_size("BUY", 5, 426.0, 0.1,   inst)
+        assert eur_small_atr == eur_no_atr, "Tiny ATR should not reduce suggested size"
+
+    def test_buy_does_not_exceed_available_budget(self):
+        inst = dict(self.BASE_INST)
+        price = 426.0
+        current_value = inst["shares_held"] * price     # ~99.97 EUR
+        available = inst["max_position_eur"] - current_value   # ~200 EUR
+        eur, _, _ = compute_position_size("BUY", 9, price, None, inst)
+        assert eur <= available + 0.01, "Suggested BUY must not exceed available budget"
+
+    def test_buy_returns_correct_shares(self):
+        inst = dict(self.BASE_INST)
+        price = 400.0
+        eur, shares, _ = compute_position_size("BUY", 4, price, None, inst)
+        expected_shares = round(eur / price, 6)
+        assert shares == expected_shares
+
+    def test_buy_eur_rounded_to_2dp(self):
+        inst = dict(self.BASE_INST)
+        eur, _, _ = compute_position_size("BUY", 4, 426.23, 1.23, inst)
+        assert eur == round(eur, 2)
+
+    def test_sell_high_confidence_sells_all(self):
+        inst = dict(self.BASE_INST, shares_held=1.0)
+        price = 430.0
+        eur, shares, _ = compute_position_size("SELL", 5, price, None, inst)
+        assert shares == 1.0, "HIGH confidence SELL should suggest selling all shares"
+        assert eur == round(1.0 * price, 2)
+
+    def test_sell_low_confidence_sells_fraction(self):
+        inst = dict(self.BASE_INST, shares_held=1.0)
+        price = 430.0
+        eur_high, shares_high, _ = compute_position_size("SELL", 5, price, None, inst)
+        eur_low,  shares_low,  _ = compute_position_size("SELL", 3, price, None, inst)
+        assert shares_low < shares_high, "LOW conf SELL should suggest fewer shares"
+
+    def test_sell_zero_shares_returns_zero(self):
+        inst = dict(self.BASE_INST, shares_held=0.0)
+        eur, shares, rationale = compute_position_size("SELL", 5, 426.0, None, inst)
+        assert eur == 0.0
+        assert shares == 0.0
+        assert "no shares" in rationale.lower()
+
+    def test_buy_zero_price_returns_zero(self):
+        inst = dict(self.BASE_INST)
+        eur, shares, rationale = compute_position_size("BUY", 5, 0.0, None, inst)
+        assert eur == 0.0
+        assert shares == 0.0
+
+    def test_already_at_max_position_returns_zero(self):
+        # shares_held × price ≥ max_position_eur → available = 0
+        inst = dict(self.BASE_INST, shares_held=1.0, max_position_eur=100.0)
+        price = 200.0  # current value = 200 ≥ max_position_eur=100
+        eur, shares, _ = compute_position_size("BUY", 5, price, None, inst)
+        assert eur == 0.0, "Should not suggest buying when already at max position"
+
+    def test_itky_scale_sizing(self):
+        """ITKY.AS is a low-priced ETF — check sizing scales correctly."""
+        inst = {
+            "buy_price":          15.76,
+            "shares_held":        1.01437,
+            "total_invested":     16.99,
+            "max_position_eur":   100.0,
+            "risk_per_trade_pct": 2.0,
+        }
+        price = 18.53
+        eur, shares, _ = compute_position_size("BUY", 4, price, 0.07, inst)
+        assert eur >= 0.0
+        assert shares >= 0.0
+        assert eur <= inst["max_position_eur"]

@@ -276,20 +276,96 @@ def in_cooldown(con, instrument_id, engine, signal_type, cooldown_minutes):
 
 
 def save_signal(con, instrument_id, engine, signal_type, price, reason,
-                ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence):
+                ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence,
+                suggested_eur=None, suggested_shares=None):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     con.execute(
         """INSERT INTO signals
            (instrument_id, ts, signal_type, engine, price, reason,
-            ma_short, ma_long, rsi, macd_line, macd_signal_line, pct_from_buy, confidence)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ma_short, ma_long, rsi, macd_line, macd_signal_line, pct_from_buy, confidence,
+            suggested_eur, suggested_shares)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (instrument_id, ts, signal_type, engine, price, reason,
-         ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence),
+         ma_short, ma_long, rsi, macd_line, macd_sig, pct, confidence,
+         suggested_eur, suggested_shares),
     )
     con.commit()
-    logging.info("[%s][%s] Signal: %s price=%.4f pct=%s conf=%s",
+    logging.info("[%s][%s] Signal: %s price=%.4f pct=%s conf=%s size=%.2f€",
                  instrument_id, engine, signal_type, price,
-                 f"{pct:.2f}%" if pct is not None else "n/a", confidence)
+                 f"{pct:.2f}%" if pct is not None else "n/a", confidence,
+                 suggested_eur or 0)
+
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+
+def compute_position_size(signal, confidence_score, price, atr, inst):
+    """
+    ATR-adjusted fractional position sizing.
+
+    BUY:
+      1. Base fraction from confidence — LOW=25%, MEDIUM=50%, HIGH=75% of max_position_eur.
+      2. ATR risk cap — reduce if (shares × ATR) would exceed risk_per_trade_pct of total_invested.
+      3. Already-held value is subtracted from max_position_eur so we never over-allocate.
+
+    SELL:
+      Suggest selling a fraction of current holdings.
+      LOW=33%, MEDIUM=50%, HIGH=100%.
+
+    Returns (suggested_eur, suggested_shares, rationale_str).
+    """
+    max_pos_eur   = float(inst.get("max_position_eur",    inst.get("total_invested", 100) * 3))
+    risk_pct      = float(inst.get("risk_per_trade_pct",  2.0)) / 100.0
+    total_inv     = float(inst.get("total_invested",      100.0))
+    shares_held   = float(inst.get("shares_held",         0.0))
+
+    if price <= 0:
+        return 0.0, 0.0, "price unavailable"
+
+    # Confidence → base fraction
+    if confidence_score >= 5:
+        frac, conf_label = 0.75, "HIGH"
+    elif confidence_score >= 4:
+        frac, conf_label = 0.50, "MEDIUM"
+    else:
+        frac, conf_label = 0.25, "LOW"
+
+    if signal == "BUY":
+        # How much room is left before hitting max_position_eur?
+        current_value  = shares_held * price
+        available_eur  = max(0.0, max_pos_eur - current_value)
+        base_eur       = frac * available_eur
+
+        rationale_parts = [f"{conf_label} conf → {frac*100:.0f}% of {available_eur:.2f}€ available"]
+
+        if atr and atr > 0:
+            # ATR risk cap: if price drops 1 ATR after buying, loss ≤ risk budget
+            risk_budget_eur  = risk_pct * total_inv          # e.g. 2% of 101€ = 2.02€
+            risk_fraction    = atr / price                    # e.g. 0.8/425 ≈ 0.19%
+            max_eur_by_risk  = risk_budget_eur / risk_fraction if risk_fraction > 0 else base_eur
+            if max_eur_by_risk < base_eur:
+                rationale_parts.append(
+                    f"ATR-capped from {base_eur:.2f}€ → {max_eur_by_risk:.2f}€ "
+                    f"(risk {risk_budget_eur:.2f}€ / ATR {atr:.3f})"
+                )
+                base_eur = max_eur_by_risk
+
+        suggested_eur    = round(max(0.0, base_eur), 2)
+        suggested_shares = round(suggested_eur / price, 6)
+        rationale        = ", ".join(rationale_parts)
+        return suggested_eur, suggested_shares, rationale
+
+    elif signal == "SELL":
+        if shares_held <= 0:
+            return 0.0, 0.0, "no shares held"
+        sell_fracs = {0.25: 0.33, 0.50: 0.50, 0.75: 1.00}
+        sell_frac  = sell_fracs.get(frac, frac)
+        sell_shares = round(shares_held * sell_frac, 6)
+        sell_eur    = round(sell_shares * price, 2)
+        rationale   = (f"{conf_label} conf → sell {sell_frac*100:.0f}% of {shares_held:.6f} shares "
+                       f"({shares_held * price:.2f}€ position)")
+        return sell_eur, sell_shares, rationale
+
+    return 0.0, 0.0, "unknown signal"
 
 
 # ── Signal engines ────────────────────────────────────────────────────────────
@@ -541,6 +617,17 @@ def send_telegram(inst, price, pct, results):
             t15 = r["mtf"].get("trend_15m", "neutral")
             t1h = r["mtf"].get("trend_1h",  "neutral")
             lines.append(f"   MTF:   15m {t15.upper()}  |  1h {t1h.upper()}")
+        # Position sizing recommendation
+        sug_eur    = r.get("suggested_eur")
+        sug_shares = r.get("suggested_shares")
+        sug_reason = r.get("sizing_rationale", "")
+        if sug_eur is not None and sug_eur > 0:
+            action_verb = "BUY" if sig == "BUY" else "SELL"
+            lines.append(f"   💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            if sug_reason:
+                lines.append(f"      ({sug_reason})")
+        elif sug_eur == 0:
+            lines.append(f"   💶 Suggested: no action ({sug_reason})")
         lines.append("")
 
     if buy_price:
@@ -714,18 +801,24 @@ def analyse_instrument(inst, con, force=False):
         reason_str = " + ".join(c_reasons)
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
+        sug_eur, sug_shares, sug_reason = compute_position_size(c_sig, c_score, price, atr_v, inst)
         save_signal(con, iid, "confluence", c_sig, price, reason_str,
-                    ef_curr, es_curr, rsi_v, macd_l, macd_s, pct, conf_label(c_score))
+                    ef_curr, es_curr, rsi_v, macd_l, macd_s, pct, conf_label(c_score),
+                    sug_eur, sug_shares)
         telegram_results.append({
             "engine": "confluence", "signal_type": c_sig,
             "reason": reason_str, "confidence": conf_label(c_score), "score": c_score,
             "rsi": rsi_v, "macd_l": macd_l, "macd_s": macd_s,
             "vwap": vwap_v, "atr": atr_v, "vol_ratio": vol_v, "mtf": mtf,
+            "suggested_eur": sug_eur, "suggested_shares": sug_shares, "sizing_rationale": sug_reason,
         })
         if force:
             print(f"\n  ✅ CONFLUENCE: {c_sig} [{conf_label(c_score)}, score {c_score}/9]")
             for r in c_reasons:
                 print(f"     • {r}")
+            action_verb = "BUY" if c_sig == "BUY" else "SELL"
+            print(f"     💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            print(f"        ({sug_reason})")
     elif force:
         if not confluence_has_new:
             print(f"\n  ℹ️  CONFLUENCE: skipped — no new price data since last signal")
@@ -741,15 +834,22 @@ def analyse_instrument(inst, con, force=False):
     if m_sig and macd_has_new and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
+        # MACD-only engine doesn't have a confluence score; use a default score of 3 (LOW)
+        sug_eur, sug_shares, sug_reason = compute_position_size(m_sig, 3, price, None, inst)
         save_signal(con, iid, "macd", m_sig, price, m_reason,
-                    ef_curr, es_curr, rsi_v, m_macd_l, m_macd_s, pct, None)
+                    ef_curr, es_curr, rsi_v, m_macd_l, m_macd_s, pct, None,
+                    sug_eur, sug_shares)
         telegram_results.append({
             "engine": "macd", "signal_type": m_sig, "reason": m_reason,
             "macd_l": m_macd_l, "macd_s": m_macd_s,
+            "suggested_eur": sug_eur, "suggested_shares": sug_shares, "sizing_rationale": sug_reason,
         })
         if force:
             print(f"  ✅ MACD ENGINE: {m_sig}")
             print(f"     • {m_reason}")
+            action_verb = "BUY" if m_sig == "BUY" else "SELL"
+            print(f"     💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            print(f"        ({sug_reason})")
     elif force:
         if not macd_has_new:
             print(f"  ℹ️  MACD ENGINE: skipped — no new price data since last signal")

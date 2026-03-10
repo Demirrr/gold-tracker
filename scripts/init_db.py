@@ -38,6 +38,8 @@ def init_db():
         macd_signal_line REAL,
         pct_from_buy     REAL,
         confidence       TEXT,               -- LOW | MEDIUM | HIGH (confluence only)
+        suggested_eur    REAL,               -- position sizing: recommended EUR amount
+        suggested_shares REAL,               -- position sizing: recommended share count
         notified_at      TEXT
     );
 
