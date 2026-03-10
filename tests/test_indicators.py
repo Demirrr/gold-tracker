@@ -361,11 +361,12 @@ class TestPositionSizing:
     """Tests for compute_position_size(signal, confidence_score, price, atr, inst)."""
 
     BASE_INST = {
-        "buy_price":          426.23,
-        "shares_held":        0.234609,
-        "total_invested":     101.0,
-        "max_position_eur":   300.0,
-        "risk_per_trade_pct": 2.0,
+        "buy_price":            426.23,
+        "shares_held":          0.234609,
+        "total_invested":       101.0,
+        "max_position_eur":     300.0,
+        "risk_per_trade_pct":   2.0,
+        "transaction_fee_eur":  1.0,
     }
 
     def test_high_confidence_buy_larger_than_low(self):
@@ -404,10 +405,12 @@ class TestPositionSizing:
         assert eur <= available + 0.01, "Suggested BUY must not exceed available budget"
 
     def test_buy_returns_correct_shares(self):
+        # shares = (total_cost - fee) / price
         inst = dict(self.BASE_INST)
         price = 400.0
-        eur, shares, _ = compute_position_size("BUY", 4, price, None, inst)
-        expected_shares = round(eur / price, 6)
+        fee   = inst["transaction_fee_eur"]
+        total_cost, shares, _ = compute_position_size("BUY", 4, price, None, inst)
+        expected_shares = round(max(0.0, total_cost - fee) / price, 6)
         assert shares == expected_shares
 
     def test_buy_eur_rounded_to_2dp(self):
@@ -418,9 +421,11 @@ class TestPositionSizing:
     def test_sell_high_confidence_sells_all(self):
         inst = dict(self.BASE_INST, shares_held=1.0)
         price = 430.0
-        eur, shares, _ = compute_position_size("SELL", 5, price, None, inst)
+        fee   = inst["transaction_fee_eur"]
+        net_eur, shares, _ = compute_position_size("SELL", 5, price, None, inst)
         assert shares == 1.0, "HIGH confidence SELL should suggest selling all shares"
-        assert eur == round(1.0 * price, 2)
+        # net proceeds = gross - fee
+        assert net_eur == round(1.0 * price - fee, 2)
 
     def test_sell_low_confidence_sells_fraction(self):
         inst = dict(self.BASE_INST, shares_held=1.0)
@@ -449,14 +454,34 @@ class TestPositionSizing:
         eur, shares, _ = compute_position_size("BUY", 5, price, None, inst)
         assert eur == 0.0, "Should not suggest buying when already at max position"
 
+    def test_fee_deducted_from_buy_shares(self):
+        """1€ fee must reduce shares acquired vs a fee-free buy."""
+        inst_with_fee    = dict(self.BASE_INST, transaction_fee_eur=1.0)
+        inst_without_fee = dict(self.BASE_INST, transaction_fee_eur=0.0)
+        price = 426.0
+        _, shares_with,    _ = compute_position_size("BUY", 4, price, None, inst_with_fee)
+        _, shares_without, _ = compute_position_size("BUY", 4, price, None, inst_without_fee)
+        assert shares_with < shares_without, "Fee should reduce shares acquired"
+
+    def test_fee_deducted_from_sell_proceeds(self):
+        """1€ fee must reduce net proceeds vs a fee-free sell."""
+        inst_with_fee    = dict(self.BASE_INST, shares_held=1.0, transaction_fee_eur=1.0)
+        inst_without_fee = dict(self.BASE_INST, shares_held=1.0, transaction_fee_eur=0.0)
+        price = 430.0
+        net_with,    _, _ = compute_position_size("SELL", 5, price, None, inst_with_fee)
+        net_without, _, _ = compute_position_size("SELL", 5, price, None, inst_without_fee)
+        assert net_with < net_without, "Fee should reduce net sell proceeds"
+        assert net_without - net_with == pytest.approx(1.0)
+
     def test_itky_scale_sizing(self):
         """ITKY.AS is a low-priced ETF — check sizing scales correctly."""
         inst = {
-            "buy_price":          15.76,
-            "shares_held":        1.01437,
-            "total_invested":     16.99,
-            "max_position_eur":   100.0,
-            "risk_per_trade_pct": 2.0,
+            "buy_price":            15.76,
+            "shares_held":          1.01437,
+            "total_invested":       16.99,
+            "max_position_eur":     100.0,
+            "risk_per_trade_pct":   2.0,
+            "transaction_fee_eur":  1.0,
         }
         price = 18.53
         eur, shares, _ = compute_position_size("BUY", 4, price, 0.07, inst)

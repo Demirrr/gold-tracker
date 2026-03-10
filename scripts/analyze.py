@@ -300,16 +300,19 @@ def save_signal(con, instrument_id, engine, signal_type, price, reason,
 
 def compute_position_size(signal, confidence_score, price, atr, inst):
     """
-    ATR-adjusted fractional position sizing.
+    ATR-adjusted fractional position sizing with transaction fee deduction.
 
     BUY:
       1. Base fraction from confidence — LOW=25%, MEDIUM=50%, HIGH=75% of max_position_eur.
       2. ATR risk cap — reduce if (shares × ATR) would exceed risk_per_trade_pct of total_invested.
       3. Already-held value is subtracted from max_position_eur so we never over-allocate.
+      4. Transaction fee is deducted from the investable amount before computing shares.
+         suggested_eur = total cash to spend (shares + fee).
+         suggested_shares = (suggested_eur - fee) / price.
 
     SELL:
-      Suggest selling a fraction of current holdings.
-      LOW=33%, MEDIUM=50%, HIGH=100%.
+      Suggest selling a fraction of current holdings (LOW=33%, MEDIUM=50%, HIGH=100%).
+      suggested_eur = gross proceeds from the sale MINUS the fee (net in pocket).
 
     Returns (suggested_eur, suggested_shares, rationale_str).
     """
@@ -317,6 +320,7 @@ def compute_position_size(signal, confidence_score, price, atr, inst):
     risk_pct      = float(inst.get("risk_per_trade_pct",  2.0)) / 100.0
     total_inv     = float(inst.get("total_invested",      100.0))
     shares_held   = float(inst.get("shares_held",         0.0))
+    fee           = float(inst.get("transaction_fee_eur", 1.0))
 
     if price <= 0:
         return 0.0, 0.0, "price unavailable"
@@ -339,9 +343,9 @@ def compute_position_size(signal, confidence_score, price, atr, inst):
 
         if atr and atr > 0:
             # ATR risk cap: if price drops 1 ATR after buying, loss ≤ risk budget
-            risk_budget_eur  = risk_pct * total_inv          # e.g. 2% of 101€ = 2.02€
-            risk_fraction    = atr / price                    # e.g. 0.8/425 ≈ 0.19%
-            max_eur_by_risk  = risk_budget_eur / risk_fraction if risk_fraction > 0 else base_eur
+            risk_budget_eur = risk_pct * total_inv           # e.g. 2% of 101€ = 2.02€
+            risk_fraction   = atr / price                    # fraction of price per ATR move
+            max_eur_by_risk = risk_budget_eur / risk_fraction if risk_fraction > 0 else base_eur
             if max_eur_by_risk < base_eur:
                 rationale_parts.append(
                     f"ATR-capped from {base_eur:.2f}€ → {max_eur_by_risk:.2f}€ "
@@ -349,21 +353,23 @@ def compute_position_size(signal, confidence_score, price, atr, inst):
                 )
                 base_eur = max_eur_by_risk
 
-        suggested_eur    = round(max(0.0, base_eur), 2)
-        suggested_shares = round(suggested_eur / price, 6)
+        total_cost       = round(max(0.0, base_eur), 2)          # total cash out (shares + fee)
+        net_investable   = max(0.0, total_cost - fee)             # cash going into shares
+        suggested_shares = round(net_investable / price, 6) if price > 0 else 0.0
         rationale        = ", ".join(rationale_parts)
-        return suggested_eur, suggested_shares, rationale
+        return total_cost, suggested_shares, rationale
 
     elif signal == "SELL":
         if shares_held <= 0:
             return 0.0, 0.0, "no shares held"
-        sell_fracs = {0.25: 0.33, 0.50: 0.50, 0.75: 1.00}
-        sell_frac  = sell_fracs.get(frac, frac)
+        sell_fracs  = {0.25: 0.33, 0.50: 0.50, 0.75: 1.00}
+        sell_frac   = sell_fracs.get(frac, frac)
         sell_shares = round(shares_held * sell_frac, 6)
-        sell_eur    = round(sell_shares * price, 2)
+        gross_eur   = round(sell_shares * price, 2)
+        net_eur     = round(max(0.0, gross_eur - fee), 2)         # proceeds after fee
         rationale   = (f"{conf_label} conf → sell {sell_frac*100:.0f}% of {shares_held:.6f} shares "
-                       f"({shares_held * price:.2f}€ position)")
-        return sell_eur, sell_shares, rationale
+                       f"(gross {gross_eur:.2f}€ − {fee:.2f}€ fee = {net_eur:.2f}€ net)")
+        return net_eur, sell_shares, rationale
 
     return 0.0, 0.0, "unknown signal"
 
@@ -621,9 +627,21 @@ def send_telegram(inst, price, pct, results):
         sug_eur    = r.get("suggested_eur")
         sug_shares = r.get("suggested_shares")
         sug_reason = r.get("sizing_rationale", "")
+        fee        = float(inst.get("transaction_fee_eur", 1.0))
         if sug_eur is not None and sug_eur > 0:
-            action_verb = "BUY" if sig == "BUY" else "SELL"
-            lines.append(f"   💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            if sig == "BUY":
+                net_investable = max(0.0, sug_eur - fee)
+                lines.append(
+                    f"   💶 Suggested BUY:  {sug_eur:.2f}€ total  "
+                    f"({net_investable:.2f}€ into shares + {fee:.2f}€ fee)"
+                )
+                lines.append(f"      → ~{sug_shares:.6f} shares @ {price:.4f}")
+            else:
+                gross_eur = round(sug_shares * price, 2)
+                lines.append(
+                    f"   💶 Suggested SELL: {sug_shares:.6f} shares  "
+                    f"(gross {gross_eur:.2f}€ − {fee:.2f}€ fee = {sug_eur:.2f}€ net)"
+                )
             if sug_reason:
                 lines.append(f"      ({sug_reason})")
         elif sug_eur == 0:
@@ -816,8 +834,14 @@ def analyse_instrument(inst, con, force=False):
             print(f"\n  ✅ CONFLUENCE: {c_sig} [{conf_label(c_score)}, score {c_score}/9]")
             for r in c_reasons:
                 print(f"     • {r}")
-            action_verb = "BUY" if c_sig == "BUY" else "SELL"
-            print(f"     💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            fee = inst.get("transaction_fee_eur", 1.0)
+            if c_sig == "BUY":
+                net_inv = max(0.0, sug_eur - fee)
+                print(f"     💶 Suggested BUY:  {sug_eur:.2f}€ total  ({net_inv:.2f}€ into shares + {fee:.2f}€ fee)")
+                print(f"        → ~{sug_shares:.6f} shares @ {price:.4f}")
+            else:
+                gross = round(sug_shares * price, 2)
+                print(f"     💶 Suggested SELL: {sug_shares:.6f} shares  (gross {gross:.2f}€ − {fee:.2f}€ fee = {sug_eur:.2f}€ net)")
             print(f"        ({sug_reason})")
     elif force:
         if not confluence_has_new:
@@ -847,8 +871,14 @@ def analyse_instrument(inst, con, force=False):
         if force:
             print(f"  ✅ MACD ENGINE: {m_sig}")
             print(f"     • {m_reason}")
-            action_verb = "BUY" if m_sig == "BUY" else "SELL"
-            print(f"     💶 Suggested: {action_verb} {sug_eur:.2f}€  (~{sug_shares:.6f} shares)")
+            fee = inst.get("transaction_fee_eur", 1.0)
+            if m_sig == "BUY":
+                net_inv = max(0.0, sug_eur - fee)
+                print(f"     💶 Suggested BUY:  {sug_eur:.2f}€ total  ({net_inv:.2f}€ into shares + {fee:.2f}€ fee)")
+                print(f"        → ~{sug_shares:.6f} shares @ {price:.4f}")
+            else:
+                gross = round(sug_shares * price, 2)
+                print(f"     💶 Suggested SELL: {sug_shares:.6f} shares  (gross {gross:.2f}€ − {fee:.2f}€ fee = {sug_eur:.2f}€ net)")
             print(f"        ({sug_reason})")
     elif force:
         if not macd_has_new:
