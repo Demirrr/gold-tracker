@@ -398,9 +398,13 @@ def save_signal(con, instrument_id, engine, signal_type, price, reason,
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 
-def compute_kelly_fraction(con, instrument_id, min_trades=30):
+def compute_kelly_fraction(con, instrument_id, engine=None, min_trades=30):
     """
     Compute half-Kelly position fraction from graded signal outcomes.
+
+    When `engine` is supplied (e.g. "confluence" or "macd") only that engine's
+    outcomes are used, giving independent fractions that reflect each engine's
+    actual win-rate and payoff ratio.
 
     Requires at least `min_trades` graded outcomes.  Returns a fraction in
     [0.05, 0.75] or None if insufficient data.
@@ -409,19 +413,35 @@ def compute_kelly_fraction(con, instrument_id, min_trades=30):
     We use half-Kelly (f/2) to reduce volatility from parameter estimation error.
     """
     try:
-        rows = con.execute(
-            """
-            SELECT s.signal_type, s.price, o.price_24h
-            FROM signals s
-            JOIN outcomes o ON o.signal_id = s.id
-            WHERE s.instrument_id = ?
-              AND o.price_24h IS NOT NULL
-              AND s.price > 0
-            ORDER BY s.ts DESC
-            LIMIT 200
-            """,
-            (instrument_id,),
-        ).fetchall()
+        if engine:
+            rows = con.execute(
+                """
+                SELECT s.signal_type, s.price, o.price_24h
+                FROM signals s
+                JOIN outcomes o ON o.signal_id = s.id
+                WHERE s.instrument_id = ?
+                  AND s.engine = ?
+                  AND o.price_24h IS NOT NULL
+                  AND s.price > 0
+                ORDER BY s.ts DESC
+                LIMIT 200
+                """,
+                (instrument_id, engine),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT s.signal_type, s.price, o.price_24h
+                FROM signals s
+                JOIN outcomes o ON o.signal_id = s.id
+                WHERE s.instrument_id = ?
+                  AND o.price_24h IS NOT NULL
+                  AND s.price > 0
+                ORDER BY s.ts DESC
+                LIMIT 200
+                """,
+                (instrument_id,),
+            ).fetchall()
     except Exception:
         return None
 
@@ -454,11 +474,13 @@ def compute_kelly_fraction(con, instrument_id, min_trades=30):
     return round(min(0.75, max(0.05, half_kelly)), 4)
 
 
-def compute_position_size(signal, confidence_score, price, atr, inst, con=None):
+def compute_position_size(signal, confidence_score, price, atr, inst, con=None, engine=None):
     """
     ATR-adjusted fractional position sizing with transaction fee deduction.
-    When ≥30 graded outcomes are available, applies half-Kelly sizing instead
-    of the fixed confidence tiers.
+    When ≥30 graded outcomes are available for the given engine, applies
+    half-Kelly sizing instead of the fixed confidence tiers.  Passing
+    engine="confluence" or engine="macd" uses that engine's own win-rate
+    history; passing engine=None (or omitting it) pools all outcomes.
 
     BUY:
       1. Base fraction from Kelly (if ≥30 trades) or confidence tiers
@@ -484,11 +506,11 @@ def compute_position_size(signal, confidence_score, price, atr, inst, con=None):
     if price <= 0:
         return 0.0, 0.0, "price unavailable"
 
-    # Try Kelly Criterion first (requires sufficient trade history)
+    # Try Kelly Criterion first (requires sufficient trade history per engine)
     kelly_frac = None
     sizing_method = "confidence"
     if con is not None:
-        kelly_frac = compute_kelly_fraction(con, inst.get("id", ""))
+        kelly_frac = compute_kelly_fraction(con, inst.get("id", ""), engine=engine)
 
     # Confidence → base fraction (fallback or when Kelly unavailable)
     if confidence_score >= 5:
@@ -500,7 +522,8 @@ def compute_position_size(signal, confidence_score, price, atr, inst, con=None):
 
     if kelly_frac is not None:
         frac = kelly_frac
-        sizing_method = f"Kelly({kelly_frac:.2%})"
+        engine_tag = f":{engine}" if engine else ""
+        sizing_method = f"Kelly{engine_tag}({kelly_frac:.2%})"
 
     if signal == "BUY":
         # How much room is left before hitting max_position_eur?
@@ -1069,6 +1092,20 @@ def analyse_instrument(inst, con, force=False):
         vol_min = inst.get("volume_min_mult", 0.8)
         if vol_ratio is not None and vol_ratio < vol_min:
             print(f"  ⚠️  Volume gate: {vol_ratio:.2f}× < {vol_min}× minimum — signals would be suppressed")
+        print(f"")
+        print(f"  ── Position sizing ─────────────────────────────────")
+        for eng in ("confluence", "macd"):
+            kf = compute_kelly_fraction(con, iid, engine=eng)
+            n_outcomes = con.execute(
+                """SELECT COUNT(*) FROM signals s JOIN outcomes o ON o.signal_id = s.id
+                   WHERE s.instrument_id = ? AND s.engine = ? AND o.price_24h IS NOT NULL""",
+                (iid, eng),
+            ).fetchone()[0]
+            if kf is not None:
+                print(f"  Kelly ({eng:<11}): {kf:.2%}  ({n_outcomes} graded outcomes)")
+            else:
+                need = 30 - n_outcomes
+                print(f"  Kelly ({eng:<11}): not yet ({n_outcomes}/30 graded outcomes, need {need} more)")
 
     # Run both engines
     c_sig, c_reasons, c_score, rsi_v, macd_l, macd_s, vwap_v, atr_v, vol_v, adx_v = \
@@ -1090,7 +1127,7 @@ def analyse_instrument(inst, con, force=False):
             reason_str = "[PAPER] " + reason_str
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
-        sug_eur, sug_shares, sug_reason = compute_position_size(c_sig, c_score, price, atr_v, inst, con)
+        sug_eur, sug_shares, sug_reason = compute_position_size(c_sig, c_score, price, atr_v, inst, con, engine="confluence")
         save_signal(con, iid, "confluence", c_sig, price, reason_str,
                     ef_curr, es_curr, rsi_v, macd_l, macd_s, pct, conf_label(c_score),
                     sug_eur, sug_shares)
@@ -1133,7 +1170,7 @@ def analyse_instrument(inst, con, force=False):
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
         # MACD-only engine doesn't have a confluence score; use a default score of 3 (LOW)
-        sug_eur, sug_shares, sug_reason = compute_position_size(m_sig, 3, price, None, inst, con)
+        sug_eur, sug_shares, sug_reason = compute_position_size(m_sig, 3, price, None, inst, con, engine="macd")
         macd_reason_str = ("[PAPER] " + m_reason) if paper else m_reason
         save_signal(con, iid, "macd", m_sig, price, macd_reason_str,
                     ef_curr, es_curr, rsi_v, m_macd_l, m_macd_s, pct, None,

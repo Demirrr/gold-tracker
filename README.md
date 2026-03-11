@@ -434,7 +434,7 @@ This data lets you evaluate which engine performs better over time and tune thre
 - **Data retention policy** — Archive or delete 2-min bars older than N days; at 2-min resolution the `prices` table grows ~700 rows/day per instrument and will bloat the DB over months
 
 #### 🟡 Medium priority — signal quality & analysis
-- **Per-engine Kelly criterion** — Confluence and MACD engines have different hit rates; compute separate Kelly fractions per engine using `outcomes` filtered by `engine` column rather than pooling all outcomes together
+- **Per-engine Kelly criterion** — Confluence and MACD engines now compute independent half-Kelly fractions using each engine's own graded outcomes; `compute_kelly_fraction` accepts an `engine` parameter and the `--force` output shows how many graded outcomes each engine has accumulated toward the 30-trade threshold
 - **Backtesting framework** — Replay historical bars from the `prices` table against the current signal logic to tune parameters (EMA periods, score thresholds, cooldowns) without waiting for live forward-tests
 - **Strategy comparison report** — Weekly cron Telegram message comparing hit rate, avg P/L, and Kelly fraction of both engines; makes it easy to spot if one engine is consistently underperforming
 - **More signal engines** — Bollinger Bands mean-reversion, ATR-based volatility stop, Stochastic oscillator

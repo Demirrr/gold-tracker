@@ -4,6 +4,7 @@ These tests use synthetic price series with known mathematical properties,
 so they do NOT require a database or network access.
 """
 import sys
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from analyze import (
     resample_ohlcv,
     get_mtf_trend,
     compute_position_size,
+    compute_kelly_fraction,
 )
 
 
@@ -488,3 +490,99 @@ class TestPositionSizing:
         assert eur >= 0.0
         assert shares >= 0.0
         assert eur <= inst["max_position_eur"]
+
+    def test_engine_parameter_accepted(self):
+        """compute_position_size should accept engine kwarg without error."""
+        inst = dict(self.BASE_INST)
+        # con=None → Kelly skipped; engine kwarg must still be accepted
+        eur_c, _, _ = compute_position_size("BUY", 4, 426.0, None, inst, con=None, engine="confluence")
+        eur_m, _, _ = compute_position_size("BUY", 4, 426.0, None, inst, con=None, engine="macd")
+        # Without a DB both fall back to confidence tiers → identical
+        assert eur_c == eur_m
+
+    def test_engine_none_fallback_matches_no_engine(self):
+        """Passing engine=None should behave identically to omitting the parameter."""
+        inst = dict(self.BASE_INST)
+        eur_default, _, _ = compute_position_size("BUY", 5, 426.0, None, inst)
+        eur_none,    _, _ = compute_position_size("BUY", 5, 426.0, None, inst, engine=None)
+        assert eur_default == eur_none
+
+
+# ── Kelly criterion ───────────────────────────────────────────────────────────
+
+def _make_kelly_db(confluence_rows, macd_rows):
+    """Build an in-memory DB with fake signals + outcomes for Kelly tests."""
+    con = sqlite3.connect(":memory:")
+    con.execute("""CREATE TABLE signals (
+        id INTEGER PRIMARY KEY, instrument_id TEXT, engine TEXT,
+        signal_type TEXT, price REAL, ts TEXT)""")
+    con.execute("""CREATE TABLE outcomes (
+        id INTEGER PRIMARY KEY, signal_id INTEGER, price_24h REAL)""")
+    sid = 1
+    for engine, rows in (("confluence", confluence_rows), ("macd", macd_rows)):
+        for sig_type, entry, exit_ in rows:
+            con.execute("INSERT INTO signals VALUES (?,?,?,?,?,?)",
+                        (sid, "inst-1", engine, sig_type, entry, "2024-01-01T00:00:00Z"))
+            con.execute("INSERT INTO outcomes VALUES (?,?,?)", (sid, sid, exit_))
+            sid += 1
+    con.commit()
+    return con
+
+
+class TestKellyCriterion:
+    # 35 winning BUY trades + 5 losing → realistic win-rate for confluence
+    CONF_ROWS = [("BUY", 100.0, 110.0)] * 35 + [("BUY", 100.0, 90.0)] * 5
+    # 35 losing BUY trades for macd (all losses → Kelly returns None for macd-only)
+    MACD_ROWS = [("BUY", 100.0, 90.0)] * 35
+
+    def test_returns_none_when_insufficient_data(self):
+        con = _make_kelly_db([], [])
+        assert compute_kelly_fraction(con, "inst-1") is None
+        assert compute_kelly_fraction(con, "inst-1", engine="confluence") is None
+
+    def test_returns_fraction_with_enough_data(self):
+        con = _make_kelly_db(self.CONF_ROWS, self.MACD_ROWS)
+        frac = compute_kelly_fraction(con, "inst-1", engine="confluence")
+        assert frac is not None
+        assert 0.05 <= frac <= 0.75
+
+    def test_per_engine_fractions_differ(self):
+        """Confluence (all wins) and MACD (all losses) must produce different fractions."""
+        con = _make_kelly_db(self.CONF_ROWS, self.MACD_ROWS)
+        frac_conf = compute_kelly_fraction(con, "inst-1", engine="confluence")
+        # MACD has 35 outcomes but all losses → no wins list → returns None
+        frac_macd = compute_kelly_fraction(con, "inst-1", engine="macd")
+        assert frac_conf is not None
+        assert frac_macd is None   # all-loss series → no wins → None
+
+    def test_pooled_differs_from_per_engine(self):
+        """Pooling all outcomes (engine=None) should give a different result than per-engine."""
+        con = _make_kelly_db(self.CONF_ROWS, self.MACD_ROWS)
+        frac_pooled = compute_kelly_fraction(con, "inst-1")
+        frac_conf   = compute_kelly_fraction(con, "inst-1", engine="confluence")
+        # Pooled mixes wins and losses; confluence-only is pure wins → fractions differ
+        assert frac_pooled != frac_conf
+
+    def test_fraction_clamped_to_bounds(self):
+        """Result must always be in [0.05, 0.75] when returned."""
+        # Mix of wins and losses so Kelly can be computed
+        rows = [("BUY", 100.0, 110.0)] * 35 + [("BUY", 100.0, 90.0)] * 5
+        con = _make_kelly_db(rows, [])
+        frac = compute_kelly_fraction(con, "inst-1", engine="confluence")
+        assert frac is not None
+        assert 0.05 <= frac <= 0.75
+
+    def test_unknown_instrument_returns_none(self):
+        con = _make_kelly_db(self.CONF_ROWS, self.MACD_ROWS)
+        assert compute_kelly_fraction(con, "does-not-exist", engine="confluence") is None
+
+    def test_position_size_uses_kelly_when_available(self):
+        """When DB has ≥30 outcomes, rationale string should mention Kelly."""
+        con = _make_kelly_db(self.CONF_ROWS, [])
+        inst = {
+            "id": "inst-1",
+            "buy_price": 100.0, "shares_held": 0.0, "total_invested": 100.0,
+            "max_position_eur": 500.0, "risk_per_trade_pct": 2.0, "transaction_fee_eur": 1.0,
+        }
+        _, _, rationale = compute_position_size("BUY", 5, 100.0, None, inst, con=con, engine="confluence")
+        assert "Kelly" in rationale
