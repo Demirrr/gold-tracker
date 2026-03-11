@@ -427,15 +427,21 @@ This data lets you evaluate which engine performs better over time and tune thre
 - **Stale data Telegram alert** — `analyze.py` fires a one-shot Telegram alert during market hours if price data is >30 min old (e.g. when `collect_price.py` crashes silently)
 
 ### Pending
+
+#### 🔴 High priority — risk & operational reliability
+- **Stop-loss alerts** — Alert when unrealized P/L drops below a configurable threshold (e.g. −5%) regardless of other signals; the most important missing safety net when away from the market
+- **Daily loss circuit-breaker** — Suppress further signals once a configurable daily loss limit is hit; prevents runaway signal-chasing in volatile sessions
+- **Data retention policy** — Archive or delete 2-min bars older than N days; at 2-min resolution the `prices` table grows ~700 rows/day per instrument and will bloat the DB over months
+
+#### 🟡 Medium priority — signal quality & analysis
+- **Per-engine Kelly criterion** — Confluence and MACD engines have different hit rates; compute separate Kelly fractions per engine using `outcomes` filtered by `engine` column rather than pooling all outcomes together
 - **Backtesting framework** — Replay historical bars from the `prices` table against the current signal logic to tune parameters (EMA periods, score thresholds, cooldowns) without waiting for live forward-tests
-- **Per-engine Kelly criterion** — Confluence and MACD engines have different hit rates; compute separate Kelly fractions per engine using `outcomes` data filtered by `engine` column
-- **Stop-loss alerts** — Alert when unrealized P/L drops below a configurable threshold (e.g. −5%) regardless of other signals; useful when away from the market
-- **Daily loss circuit-breaker** — Cap the number of signals per day per instrument; suppress further signals once a configurable daily loss limit is hit
-- **Data retention policy** — Archive or delete 2-min bars older than N days to keep the DB lean; raw OHLCV at 2-min resolution accumulates fast over months
+- **Strategy comparison report** — Weekly cron Telegram message comparing hit rate, avg P/L, and Kelly fraction of both engines; makes it easy to spot if one engine is consistently underperforming
 - **More signal engines** — Bollinger Bands mean-reversion, ATR-based volatility stop, Stochastic oscillator
-- **Strategy comparison report** — Weekly summary Telegram message comparing hit rate, avg P/L, and Kelly fraction of both engines; sent every Monday via cron
-- **Broker integration** — Auto-execute trades via broker API (e.g. IBKR, DEGIRO) and call `record_trade.py --source AUTO` on fill
-- **Machine learning** — Train a binary classifier on labelled outcomes (GOOD/BAD) to dynamically weight signal conditions; retrain weekly as new outcomes accumulate
+- **CSV / JSON export** — `--export` flag on `record_trade.py` or a standalone script to dump signals + outcomes for external analysis in Excel or Jupyter
+
+#### 🟢 Low priority — automation & infrastructure
+- **Broker integration** — Auto-execute trades via broker API (e.g. IBKR, DEGIRO) and call `record_trade.py --source AUTO` on fill; high value but high operational risk
+- **Machine learning** — Train a binary classifier on labelled outcomes (GOOD/BAD) to dynamically weight signal conditions; requires a few hundred graded outcomes before it's meaningful
 - **Web dashboard** — Flask/FastAPI endpoint serving a live chart of price + signals + outcomes with per-instrument P/L history
 - **Multi-channel alerts** — Push to Slack, Discord, or email in addition to Telegram
-- **CSV / JSON export** — `--export` flag on `record_trade.py` or a standalone script to dump signals + outcomes for external analysis in Excel or Jupyter
