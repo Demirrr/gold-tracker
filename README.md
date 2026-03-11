@@ -6,10 +6,12 @@ Automated trading signal system that tracks ETF/ETP prices via yfinance, stores 
 
 ## Instruments tracked
 
-| # | Name | Ticker | ISIN | Buy price | Shares | Total invested |
-|---|------|--------|------|-----------|--------|----------------|
+| # | Name | Ticker | ISIN | Avg buy price | Shares held | Total invested |
+|---|------|--------|------|---------------|-------------|----------------|
 | 1 | WisdomTree Physical Swiss Gold | SGBS.AS | JE00B588CD74 | 426.23 EUR | 0.234609 | 101.00 EUR |
-| 2 | iShares MSCI Turkey UCITS ETF | ITKY.AS | IE00B1FZS574 | 15.76 EUR | 1.01437 | 16.75 EUR |
+| 2 | iShares MSCI Turkey UCITS ETF | ITKY.AS | IE00B1FZS574 | 18.18 EUR | 3.629979 | 67.99 EUR |
+
+> **Avg buy price** and **Shares held** are automatically maintained by `record_trade.py` — do not edit them by hand.
 
 Both on Euronext Amsterdam (EUR). To add a new instrument, edit `scripts/instruments.json` (see [Adding a new instrument](#adding-a-new-instrument) below).
 
@@ -20,20 +22,21 @@ Both on Euronext Amsterdam (EUR). To add a new instrument, edit `scripts/instrum
 ```
 gold-tracker/
 ├── data/
-│   └── gold.db                  ← SQLite database (prices, signals, outcomes)
+│   └── gold.db                  ← SQLite database (prices, signals, outcomes, trades)
 ├── logs/
 │   ├── cron.log                 ← cron stdout/stderr
 │   ├── analyzer.log             ← signal engine log
 │   ├── collector.log            ← price collection log
 │   └── outcomes.log             ← outcome tracking log
 ├── scripts/
-│   ├── instruments.json         ← instrument registry (config per asset)
+│   ├── instruments.json         ← instrument registry (config + live position state)
 │   ├── config.py                ← system-level config (paths, env vars)
 │   ├── init_db.py               ← creates DB schema
 │   ├── migrate_db.py            ← idempotent DB migration (safe to re-run)
 │   ├── collect_price.py         ← fetch 2-min bars from yfinance → DB
 │   ├── analyze.py               ← dual engine signal analysis + Telegram
-│   └── track_outcomes.py        ← grade past signals (GOOD/BAD/NEUTRAL)
+│   ├── track_outcomes.py        ← grade past signals (GOOD/BAD/NEUTRAL)
+│   └── record_trade.py          ← record manual/executed trades, update position state
 └── venv/                        ← Python virtual environment
 ```
 
@@ -140,11 +143,13 @@ Add to `~/.bashrc` (or export in shell):
 ```bash
 export TELEGRAM_BOT_TOKEN="<your-bot-token>"
 export TELEGRAM_CHAT_ID="<your-chat-id>"
+export TELEGRAM_SCRIPT="/home/youruser/send_telegram_message.sh"  # optional: defaults to /home/cdemir/send_telegram_message.sh
 ```
 
 > ⚠️ Never commit these values. They are read from environment only.
 
 The `send_telegram_message.sh` script uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from the environment.
+`TELEGRAM_SCRIPT` overrides the path to the Telegram helper script (useful when deploying on a different machine).
 
 ### 3. Initialise the database
 
@@ -177,6 +182,7 @@ Add these lines (with your real token/chat ID):
 ```cron
 TELEGRAM_BOT_TOKEN=<your-token>
 TELEGRAM_CHAT_ID=<your-chat-id>
+TELEGRAM_SCRIPT=/home/youruser/send_telegram_message.sh
 
 # Collect price every 2 min on weekdays during Euronext hours (08:00–16:30 UTC → 07–15 safe window)
 */2 7-15 * * 1-5 /path/to/venv/bin/python /path/to/scripts/collect_price.py >> /path/to/logs/cron.log 2>&1
@@ -199,6 +205,93 @@ venv/bin/python scripts/analyze.py --force
 # or for a single instrument:
 venv/bin/python scripts/analyze.py --force --instrument sgbs-as
 ```
+
+---
+
+## Recording trades
+
+Whenever you actually execute a buy or sell (whether triggered by a signal or your own decision), record it with `record_trade.py`. This keeps position state in sync so that P/L, average cost, and position-sizing calculations remain accurate.
+
+### Record a buy
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action buy \
+  --shares 2.615609 \
+  --price 19.12 \
+  --total 51.0              # total EUR paid including fee (optional — infers fee automatically)
+```
+
+Or specify the fee explicitly:
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action buy \
+  --shares 2.615609 \
+  --price 19.12 \
+  --fee 1.0
+```
+
+### Record a sell
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action sell \
+  --shares 1.5 \
+  --price 20.50 \
+  --fee 1.0
+```
+
+### Dry run (preview without writing)
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action buy \
+  --shares 2.0 \
+  --price 19.50 \
+  --dry-run
+```
+
+### View trade history
+
+```bash
+# For a specific instrument
+venv/bin/python scripts/record_trade.py --list itky-as
+
+# All instruments
+venv/bin/python scripts/record_trade.py --list
+```
+
+### What it does under the hood
+
+| Step | What changes |
+|------|--------------|
+| **BUY** | `shares_held` increases; `buy_price` recalculated as weighted average; `total_invested` increases by total EUR paid |
+| **SELL** | `shares_held` decreases; `buy_price` unchanged (cost basis stays); `total_invested` decreases proportionally |
+| **DB** | A row is inserted into the `trades` table with full trade details, timestamp, and post-trade position snapshot |
+| **P/L** | `analyze.py` reads the updated `buy_price` from `instruments.json` — all future P/L % is automatically relative to your true average cost |
+
+> **Tip:** Always record trades before running `analyze.py --force` so the P/L display reflects your actual position.
+
+### All options
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--instrument` | `-i` | required | Instrument ID (e.g. `itky-as`) |
+| `--action` | `-a` | required | `buy` or `sell` |
+| `--shares` | | required | Number of shares transacted |
+| `--price` | | required | Price per share in EUR |
+| `--fee` | | from `instruments.json` | Transaction fee in EUR |
+| `--total` | | computed | Total EUR paid/received — if given, fee is inferred |
+| `--ts` | | now (UTC) | Trade timestamp in ISO UTC format |
+| `--source` | | `MANUAL` | `MANUAL` or `AUTO` |
+| `--notes` | | — | Free-text note stored with the trade |
+| `--list` | `-l` | — | Print trade history (instrument ID or omit for all) |
+| `--dry-run` | | — | Preview changes without writing anything |
 
 ---
 
@@ -244,6 +337,22 @@ Unique constraint on `(instrument_id, ts)`.
 | price_24h | REAL | price 24h after signal |
 | outcome | TEXT | GOOD \| BAD \| NEUTRAL |
 | filled_at | TEXT | when outcome was recorded |
+
+### `trades`
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER PK | |
+| instrument_id | TEXT | e.g. `itky-as` |
+| ts | TEXT | UTC ISO timestamp of trade execution |
+| action | TEXT | BUY \| SELL |
+| shares | REAL | shares transacted |
+| price | REAL | price per share in EUR |
+| fee | REAL | broker fee in EUR |
+| total_eur | REAL | total EUR paid (BUY) or received (SELL) |
+| source | TEXT | MANUAL \| AUTO |
+| avg_cost_after | REAL | weighted avg buy price after this trade |
+| shares_after | REAL | shares held after this trade |
+| notes | TEXT | optional free-text note |
 
 ---
 
@@ -311,13 +420,22 @@ This data lets you evaluate which engine performs better over time and tune thre
 
 ## Potential improvements
 
+### Already implemented ✅
+- **SQL injection hardening** — `record_trade.py --list` uses parameterized queries
+- **`paper_trading` enforcement** — Paper signals are tagged `[PAPER]` in the DB and Telegram messages include a `⚠️ PAPER — do not execute` warning per signal line
+- **Configurable Telegram script path** — `TELEGRAM_SCRIPT` env var overrides the hardcoded path, enabling deployment on any machine
+- **Stale data Telegram alert** — `analyze.py` fires a one-shot Telegram alert during market hours if price data is >30 min old (e.g. when `collect_price.py` crashes silently)
+
+### Pending
+- **Backtesting framework** — Replay historical bars from the `prices` table against the current signal logic to tune parameters (EMA periods, score thresholds, cooldowns) without waiting for live forward-tests
+- **Per-engine Kelly criterion** — Confluence and MACD engines have different hit rates; compute separate Kelly fractions per engine using `outcomes` data filtered by `engine` column
+- **Stop-loss alerts** — Alert when unrealized P/L drops below a configurable threshold (e.g. −5%) regardless of other signals; useful when away from the market
+- **Daily loss circuit-breaker** — Cap the number of signals per day per instrument; suppress further signals once a configurable daily loss limit is hit
+- **Data retention policy** — Archive or delete 2-min bars older than N days to keep the DB lean; raw OHLCV at 2-min resolution accumulates fast over months
 - **More signal engines** — Bollinger Bands mean-reversion, ATR-based volatility stop, Stochastic oscillator
-- **Machine learning** — Train a classifier on labelled outcomes (GOOD/BAD) to weight signal conditions dynamically
-- **Multiple timeframes** — Run daily bars alongside 2-min bars for macro trend confirmation (avoid buying a short-term dip in a long-term downtrend)
-- **Volume analysis** — Filter signals by volume spike confirmation (high volume on crossover = more reliable signal)
-- **Paper trading mode** — Simulate trades with virtual portfolio, compare virtual P/L across strategies before using real money
-- **Web dashboard** — Flask/FastAPI endpoint serving a simple chart of price + signals + outcomes
-- **Push to multiple channels** — Slack, Discord, email in addition to Telegram
-- **Dynamic thresholds** — Auto-tune `signal_threshold_pct` based on recent ATR (Average True Range) to adapt to volatility
-- **Stop-loss alerts** — Alert when P/L drops below a configurable threshold (e.g. -5%) regardless of other signals
-- **Strategy comparison report** — Weekly summary message comparing hit rate of both engines, sent every Monday
+- **Strategy comparison report** — Weekly summary Telegram message comparing hit rate, avg P/L, and Kelly fraction of both engines; sent every Monday via cron
+- **Broker integration** — Auto-execute trades via broker API (e.g. IBKR, DEGIRO) and call `record_trade.py --source AUTO` on fill
+- **Machine learning** — Train a binary classifier on labelled outcomes (GOOD/BAD) to dynamically weight signal conditions; retrain weekly as new outcomes accumulate
+- **Web dashboard** — Flask/FastAPI endpoint serving a live chart of price + signals + outcomes with per-instrument P/L history
+- **Multi-channel alerts** — Push to Slack, Discord, or email in addition to Telegram
+- **CSV / JSON export** — `--export` flag on `record_trade.py` or a standalone script to dump signals + outcomes for external analysis in Excel or Jupyter

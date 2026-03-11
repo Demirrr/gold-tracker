@@ -53,9 +53,25 @@ def init_db():
         filled_at   TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS trades (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_id TEXT    NOT NULL,
+        ts            TEXT    NOT NULL,       -- ISO UTC timestamp of trade
+        action        TEXT    NOT NULL,       -- BUY | SELL
+        shares        REAL    NOT NULL,       -- shares transacted
+        price         REAL    NOT NULL,       -- price per share (EUR)
+        fee           REAL    NOT NULL DEFAULT 1.0,
+        total_eur     REAL    NOT NULL,       -- total EUR paid (BUY) or received (SELL)
+        source        TEXT    NOT NULL DEFAULT 'MANUAL',  -- MANUAL | AUTO
+        avg_cost_after REAL,                  -- weighted avg buy price after this trade
+        shares_after  REAL,                   -- shares_held after this trade
+        notes         TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_prices_inst_ts   ON prices(instrument_id, ts);
     CREATE INDEX IF NOT EXISTS idx_signals_inst_ts  ON signals(instrument_id, ts);
     CREATE INDEX IF NOT EXISTS idx_signals_engine   ON signals(engine);
+    CREATE INDEX IF NOT EXISTS idx_trades_inst_ts   ON trades(instrument_id, ts);
     """)
 
     con.commit()

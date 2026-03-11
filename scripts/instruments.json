@@ -24,7 +24,8 @@
     "volume_min_mult": 0.8,
     "max_position_eur": 300.0,
     "risk_per_trade_pct": 2.0,
-    "transaction_fee_eur": 1.0
+    "transaction_fee_eur": 1.0,
+    "paper_trading": false
   },
   {
     "id": "itky-as",
@@ -32,9 +33,9 @@
     "ticker": "ITKY.AS",
     "isin": "IE00B1FZS574",
     "currency": "EUR",
-    "buy_price": 15.76,
-    "shares_held": 1.01437,
-    "total_invested": 16.99,
+    "buy_price": 18.181074,
+    "shares_held": 3.629979,
+    "total_invested": 67.99,
     "signal_threshold_pct": 1.0,
     "ema_fast_bars": 5,
     "ema_mid_bars": 8,
@@ -51,6 +52,7 @@
     "volume_min_mult": 0.8,
     "max_position_eur": 100.0,
     "risk_per_trade_pct": 2.0,
-    "transaction_fee_eur": 1.0
+    "transaction_fee_eur": 1.0,
+    "paper_trading": false
   }
 ]

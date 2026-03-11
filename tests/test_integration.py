@@ -278,7 +278,7 @@ class TestSignalEngines:
             if sig:
                 assert isinstance(reason, str) and len(reason) > 0
 
-    def test_confluence_engine_returns_nine_values(self, db, instrument_ids, instruments):
+    def test_confluence_engine_returns_ten_values(self, db, instrument_ids, instruments):
         for inst in instruments:
             iid = inst["id"]
             if iid not in instrument_ids:
@@ -287,7 +287,8 @@ class TestSignalEngines:
             if len(ohlcv["closes"]) < 36:
                 continue
             result = engine_confluence(ohlcv, None, inst, pct=None)
-            assert len(result) == 9
+            # sig, reasons, score, rsi, macd_l, macd_s, vwap, atr, vol_ratio, adx
+            assert len(result) == 10
             sig = result[0]
             assert sig in (None, "BUY", "SELL")
 

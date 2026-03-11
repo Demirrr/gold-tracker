@@ -13,4 +13,4 @@ LOG_DIR = BASE_DIR / "logs"
 # Telegram (read from environment — never hardcode)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_SCRIPT    = Path("/home/cdemir/send_telegram_message.sh")
+TELEGRAM_SCRIPT    = Path(os.environ.get("TELEGRAM_SCRIPT", "/home/cdemir/send_telegram_message.sh"))
