@@ -8,16 +8,17 @@ Usage:
 import argparse
 import json
 import logging
+import random
 import sqlite3
 import sys
+import time
 from datetime import timezone
 from pathlib import Path
-
-import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import DB_PATH, LOG_DIR, SCRIPTS_DIR
 from init_db import init_db
+from market_data import fetch_history
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -41,11 +42,11 @@ def collect_one(inst):
     iid    = inst["id"]
     ticker = inst["ticker"]
 
-    try:
-        df = yf.Ticker(ticker).history(period="5d", interval="2m")
-    except Exception as exc:
-        logging.warning("[%s] yfinance fetch failed: %s — skipping", iid, exc)
-        return 0
+    df, interval, source = fetch_history(
+        ticker=ticker,
+        instrument_id=iid,
+        logger=logging,
+    )
 
     if df is None or df.empty:
         logging.warning("[%s] No data returned from yfinance (market closed or rate-limited)", iid)
@@ -64,6 +65,18 @@ def collect_one(inst):
             inserted += cur.rowcount
         con.commit()
         latest_ts = df.index[-1].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        con.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (f"collector_heartbeat:{iid}", fetched_at),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (f"collector_last_source_ts:{iid}", latest_ts),
+        )
+        con.commit()
+        if interval != "2m" or source != "ticker.history":
+            logging.info("[%s] Used fallback source=%s interval=%s", iid, source, interval)
         logging.info("[%s] Inserted %d new bars. Latest: %s close=%.4f",
                      iid, inserted, latest_ts, df.Close.iloc[-1])
     except Exception as exc:
@@ -75,6 +88,8 @@ def collect_one(inst):
 
 
 def collect(instrument_id=None):
+    # Small random jitter (0–15 s) so cron bursts don't hit Yahoo Finance simultaneously
+    time.sleep(random.uniform(0, 15))
     init_db()
     instruments = load_instruments(instrument_id)
     for inst in instruments:

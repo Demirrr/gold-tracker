@@ -934,7 +934,20 @@ def send_telegram(inst, price, pct, results):
 
 # Track which instruments have already received a staleness alert this run
 # (avoids spamming Telegram every 2 minutes if data is stuck)
-_staleness_alerted: set = set()
+_STALE_ALERT_COOLDOWN_MIN = 30
+_COLLECTOR_HEARTBEAT_GRACE_MIN = 10
+
+
+def _meta_value(con, key):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _collector_heartbeat_age_minutes(con, instrument_id, now_utc):
+    last_fetch = _meta_value(con, f"collector_heartbeat:{instrument_id}")
+    if not last_fetch:
+        return None
+    return (now_utc - datetime.fromisoformat(last_fetch.replace("Z", "+00:00"))).total_seconds() / 60
 
 
 def check_staleness(last_ts_str, inst):
@@ -951,21 +964,51 @@ def check_staleness(last_ts_str, inst):
         and (open_h, open_m) <= (now_utc.hour, now_utc.minute) <= (close_h, close_m)
     )
     if market_open and age_min > 30:
+        iid = inst["id"]
+        con = sqlite3.connect(DB_PATH)
         msg = (f"  ⚠️  Last bar is {age_min:.0f} min old ({last_ts_str}) — "
                f"data may be stale (yfinance lags ~15–20 min for low-volume ETFs)\n")
-        iid = inst["id"]
-        if iid not in _staleness_alerted:
-            _staleness_alerted.add(iid)
-            alert = (
-                f"⚠️ STALE DATA — {inst['name']} ({iid})\n"
-                f"Last price bar is {age_min:.0f} min old ({last_ts_str}).\n"
-                f"collect_price.py may have failed — check cron logs."
-            )
-            logging.warning("[%s] Stale data alert fired (%d min old)", iid, int(age_min))
-            send_telegram_text(alert)
+        meta_key = f"stale_alert:{iid}"
+        try:
+            heartbeat_age_min = _collector_heartbeat_age_minutes(con, iid, now_utc)
+            if heartbeat_age_min is not None and heartbeat_age_min <= _COLLECTOR_HEARTBEAT_GRACE_MIN:
+                logging.info(
+                    "[%s] Latest bar is %d min old but collector heartbeat is fresh (%.1f min) — suppressing stale alert",
+                    iid,
+                    int(age_min),
+                    heartbeat_age_min,
+                )
+                return (
+                    f"  ℹ️  Last bar is {age_min:.0f} min old ({last_ts_str}), "
+                    f"but collector fetched successfully {heartbeat_age_min:.0f} min ago\n"
+                )
+            last_sent_raw = _meta_value(con, meta_key)
+            last_sent = datetime.fromisoformat(last_sent_raw) if last_sent_raw else None
+            if last_sent is None or (now_utc - last_sent).total_seconds() / 60 >= _STALE_ALERT_COOLDOWN_MIN:
+                alert = (
+                    f"⚠️ STALE DATA — {inst['name']} ({iid})\n"
+                    f"Last price bar is {age_min:.0f} min old ({last_ts_str}).\n"
+                    f"Collector heartbeat is missing or outdated — check collector.log / cron.log."
+                )
+                logging.warning("[%s] Stale data alert fired (%d min old)", iid, int(age_min))
+                send_telegram_text(alert)
+                con.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (meta_key, now_utc.isoformat()),
+                )
+                con.commit()
+        finally:
+            con.close()
         return msg
-    # Reset alert flag once data is fresh again
-    _staleness_alerted.discard(inst["id"])
+    # Reset the alert cooldown once data is fresh again
+    iid = inst["id"]
+    meta_key = f"stale_alert:{iid}"
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("DELETE FROM meta WHERE key=?", (meta_key,))
+        con.commit()
+    finally:
+        con.close()
     if not market_open:
         return f"  ℹ️  Market closed. Last bar: {last_ts_str} ({age_min:.0f} min ago)\n"
     return ""

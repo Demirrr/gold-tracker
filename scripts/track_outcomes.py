@@ -12,11 +12,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import yfinance as yf
-
 sys.path.insert(0, str(Path(__file__).parent))
 from config import DB_PATH, LOG_DIR, SCRIPTS_DIR
 from init_db import init_db
+from market_data import latest_close
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -34,8 +33,11 @@ def load_instruments(instrument_id=None):
 
 
 def current_price(ticker):
-    df = yf.Ticker(ticker).history(period="2d", interval="2m")
-    return float(df.Close.iloc[-1]) if not df.empty else None
+    return latest_close(
+        ticker=ticker,
+        instrument_id=ticker,
+        logger=logging,
+    )
 
 
 def compute_outcome(signal_type, signal_price, ref_price):

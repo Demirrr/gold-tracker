@@ -5,6 +5,7 @@ so they do NOT require a database or network access.
 """
 import sys
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ from analyze import (
     get_mtf_trend,
     compute_position_size,
     compute_kelly_fraction,
+    _collector_heartbeat_age_minutes,
+    check_staleness,
 )
 
 
@@ -253,6 +256,44 @@ class TestVWAP:
         assert abs(vwap[0] - 100.0) < 1e-6
         assert abs(vwap[1] - 105.0) < 1e-6
         assert abs(vwap[2] - 110.0) < 1e-6
+
+
+class TestStalenessHelpers:
+    def test_collector_heartbeat_age_minutes_returns_none_when_missing(self):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        age = _collector_heartbeat_age_minutes(con, "sgbs-as", datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc))
+        assert age is None
+
+    def test_check_staleness_suppresses_alert_when_collector_heartbeat_is_fresh(self, monkeypatch):
+        db_path = Path(__file__).parent / "test_staleness.db"
+        if db_path.exists():
+            db_path.unlink()
+        con = sqlite3.connect(db_path)
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("collector_heartbeat:sgbs-as", datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        con.close()
+
+        import analyze
+
+        monkeypatch.setattr(analyze, "DB_PATH", db_path)
+        monkeypatch.setattr(analyze, "send_telegram_text", lambda msg: (_ for _ in ()).throw(AssertionError(msg)))
+
+        warning = check_staleness(
+            (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat().replace("+00:00", "Z"),
+            {
+                "id": "sgbs-as",
+                "name": "Test Instrument",
+                "market_open_utc": "00:00",
+                "market_close_utc": "23:59",
+            },
+        )
+        assert "collector fetched successfully" in warning
+        db_path.unlink()
 
 
 # ── Volume ratio ──────────────────────────────────────────────────────────────

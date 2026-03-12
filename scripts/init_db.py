@@ -68,6 +68,11 @@ def init_db():
         notes         TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_prices_inst_ts   ON prices(instrument_id, ts);
     CREATE INDEX IF NOT EXISTS idx_signals_inst_ts  ON signals(instrument_id, ts);
     CREATE INDEX IF NOT EXISTS idx_signals_engine   ON signals(engine);
@@ -76,7 +81,7 @@ def init_db():
 
     con.commit()
     con.close()
-    print(f"Database initialised at {DB_PATH}")
 
 if __name__ == "__main__":
     init_db()
+    print(f"Database initialised at {DB_PATH}")
