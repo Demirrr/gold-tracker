@@ -5,9 +5,9 @@
     "ticker": "SGBS.AS",
     "isin": "JE00B588CD74",
     "currency": "EUR",
-    "buy_price": 426.23,
-    "shares_held": 0.234609,
-    "total_invested": 101.0,
+    "buy_price": 413.130001,
+    "shares_held": 1.035996,
+    "total_invested": 429.0013,
     "signal_threshold_pct": 1.0,
     "ema_fast_bars": 5,
     "ema_mid_bars": 8,
@@ -25,6 +25,8 @@
     "max_position_eur": 300.0,
     "risk_per_trade_pct": 2.0,
     "transaction_fee_eur": 1.0,
+    "stop_loss_pct": 5.0,
+    "stop_loss_cooldown_minutes": 60,
     "paper_trading": false
   },
   {
@@ -34,8 +36,8 @@
     "isin": "IE00B1FZS574",
     "currency": "EUR",
     "buy_price": 18.181074,
-    "shares_held": 3.629979,
-    "total_invested": 67.99,
+    "shares_held": 0.0,
+    "total_invested": 0.0,
     "signal_threshold_pct": 1.0,
     "ema_fast_bars": 5,
     "ema_mid_bars": 8,
@@ -53,6 +55,8 @@
     "max_position_eur": 100.0,
     "risk_per_trade_pct": 2.0,
     "transaction_fee_eur": 1.0,
+    "stop_loss_pct": 5.0,
+    "stop_loss_cooldown_minutes": 60,
     "paper_trading": false
   }
 ]

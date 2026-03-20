@@ -74,6 +74,8 @@ A multi-indicator day-trader engine. Fires when **score ≥ 3** (max 9). Each co
 
 **Safety rules:**
 - SELL suppressed if `price < buy_price` — never suggest selling at a loss
+- SELL suppressed if RSI < 30 (oversold) — selling into weakness is contradictory
+- BUY suppressed if RSI > 70 (overbought) — buying into extreme strength is contradictory
 - BUY penalised −1 if EMA fully bearish — don't buy into a downtrend
 
 **New day-trading indicators vs old version:**
@@ -102,6 +104,34 @@ Fires on MACD crossover of signal line. More forward-looking than EMA ribbon.
 | `volume_lookback_bars` | 20 | Bars used to compute average volume |
 | `volume_spike_mult` | 2.0 | Volume ratio threshold for spike detection |
 | `alert_cooldown_minutes` | 60 | Min gap between same-type signals |
+| `stop_loss_pct` | 5.0 | Alert threshold: unrealised P/L below −N% fires a stop-loss alert |
+| `stop_loss_cooldown_minutes` | 60 | Min gap between repeat stop-loss alerts |
+
+### Stop-loss monitor
+
+A dedicated safety monitor runs on every analysis cycle, independently of the signal engines. It fires a **🚨 STOP-LOSS ALERT** Telegram message when the unrealised P/L of an open position drops below the configured threshold.
+
+- Runs regardless of cooldowns, market regime, or RSI/ADX conditions.
+- Has its own cooldown (`stop_loss_cooldown_minutes`) so it won't spam every 2 minutes.
+- When the position recovers above the threshold, the cooldown is cleared so a future deterioration will alert again.
+- Skipped entirely when `shares_held = 0`, `buy_price` is unset, or `stop_loss_pct` is not configured.
+
+**Stop-loss alert message format:**
+
+```
+🚨 STOP-LOSS ALERT — WisdomTree Physical Swiss Gold
+────────────────────────────────────────
+Position has fallen below the −5.0% stop-loss threshold.
+
+📉 Current P/L : -6.23%  (-5.5142 EUR)
+   Price       : 399.6300 EUR
+   Avg cost    : 426.2300 EUR
+   Shares held : 0.234609
+   Threshold   : -5.0%
+
+⚠️  Consider reviewing your position and cutting losses.
+🕐 2026-03-20 10:30 UTC
+```
 
 ### Telegram message format
 
@@ -234,6 +264,19 @@ venv/bin/python scripts/record_trade.py \
   --fee 1.0
 ```
 
+Example: if you bought `2.615609` shares of MCI Turkey (`itky-as`) at `19.12 EUR` with a `1 EUR` fee, record it like this:
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action buy \
+  --shares 2.615609 \
+  --price 19.12 \
+  --fee 1.0
+```
+
+This records a total cash outflow of `51.0084 EUR` (`50.0084 EUR` for shares + `1 EUR` fee).
+
 ### Record a sell
 
 ```bash
@@ -244,6 +287,19 @@ venv/bin/python scripts/record_trade.py \
   --price 20.50 \
   --fee 1.0
 ```
+
+Example: if you sold `3.629936` shares of MCI Turkey (`itky-as`) at `19.42 EUR` with a `1 EUR` fee, record it like this:
+
+```bash
+venv/bin/python scripts/record_trade.py \
+  --instrument itky-as \
+  --action sell \
+  --shares 3.629936 \
+  --price 19.42 \
+  --fee 1.0
+```
+
+This records net proceeds of `69.4934 EUR` (effectively `69.49 EUR` cash after fees).
 
 ### Dry run (preview without writing)
 
@@ -426,11 +482,13 @@ This data lets you evaluate which engine performs better over time and tune thre
 - **Configurable Telegram script path** — `TELEGRAM_SCRIPT` env var overrides the hardcoded path, enabling deployment on any machine
 - **Stale data Telegram alert** — `analyze.py` fires a one-shot Telegram alert during market hours if price data is >30 min old (e.g. when `collect_price.py` crashes silently)
 - **Per-engine Kelly criterion** — `compute_kelly_fraction` accepts an `engine` parameter so Confluence and MACD each learn from their own graded outcomes independently; `--force` output shows each engine's progress toward the 30-outcome threshold; rationale in Telegram messages now shows `Kelly:confluence(...)` or `Kelly:macd(...)`
+- **Stop-loss alerts** — `check_stop_loss()` runs every cycle; fires a 🚨 Telegram alert when unrealised P/L drops below `-stop_loss_pct`; own cooldown; clears on recovery; 8 unit tests; see *Stop-loss monitor* section above
+- **Signal quality gates** — RSI oversold (< 30) suppresses SELL; RSI overbought (> 70) suppresses BUY; MACD engine skips crossovers in RSI extremes; cross-engine whiplash gate prevents MACD from contradicting a recent Confluence signal
+- **ADX calculation fix** — ADX smoothing now uses correct mean-init Wilder averaging; output guaranteed in 0–100 range
 
 ### Pending
 
 #### 🔴 High priority — risk & operational reliability
-- **Stop-loss alerts** — Alert when unrealized P/L drops below a configurable threshold (e.g. −5%) regardless of other signals; the most important missing safety net when away from the market
 - **Daily loss circuit-breaker** — Suppress further signals once a configurable daily loss limit is hit; prevents runaway signal-chasing in volatile sessions
 - **Data retention policy** — Archive or delete 2-min bars older than N days; at 2-min resolution the `prices` table grows ~700 rows/day per instrument and will bloat the DB over months
 

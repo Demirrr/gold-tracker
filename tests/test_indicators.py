@@ -25,6 +25,7 @@ from analyze import (
     compute_kelly_fraction,
     _collector_heartbeat_age_minutes,
     check_staleness,
+    check_stop_loss,
 )
 
 
@@ -627,3 +628,123 @@ class TestKellyCriterion:
         }
         _, _, rationale = compute_position_size("BUY", 5, 100.0, None, inst, con=con, engine="confluence")
         assert "Kelly" in rationale
+
+
+# ── Stop-loss monitor ─────────────────────────────────────────────────────────
+
+def _make_sl_db():
+    """In-memory SQLite DB with a minimal meta table for stop-loss cooldown tests."""
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.commit()
+    return con
+
+
+def _base_inst(buy_price=100.0, shares=1.0, sl_pct=5.0, sl_cool=60):
+    return {
+        "id": "test-inst",
+        "name": "Test Instrument",
+        "currency": "EUR",
+        "buy_price": buy_price,
+        "shares_held": shares,
+        "stop_loss_pct": sl_pct,
+        "stop_loss_cooldown_minutes": sl_cool,
+    }
+
+
+class TestStopLoss:
+    """Unit tests for check_stop_loss() — the stop-loss monitor function.
+
+    All tests use an in-memory DB and a patched send_telegram_text so no real
+    Telegram messages are ever sent.
+    """
+
+    def test_no_breach_returns_false(self, monkeypatch):
+        """P/L above threshold: function returns (False, pl_pct, threshold)."""
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: None)
+        inst = _base_inst(buy_price=100.0, shares=1.0, sl_pct=5.0)
+        triggered, pl_pct, threshold = check_stop_loss(inst, 97.0, _make_sl_db())
+        assert triggered is False
+        assert abs(pl_pct - (-3.0)) < 0.01
+        assert threshold == -5.0
+
+    def test_breach_triggers_alert(self, monkeypatch):
+        """P/L below threshold: function returns True and calls send_telegram_text."""
+        sent = []
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: sent.append(msg))
+        inst = _base_inst(buy_price=100.0, shares=1.0, sl_pct=5.0)
+        triggered, pl_pct, threshold = check_stop_loss(inst, 94.0, _make_sl_db())
+        assert triggered is True
+        assert pl_pct < -5.0
+        assert len(sent) == 1
+        assert "STOP-LOSS" in sent[0]
+        assert "test-inst" in sent[0] or "Test Instrument" in sent[0]
+
+    def test_cooldown_suppresses_repeat_alert(self, monkeypatch):
+        """Second breach within cooldown window must NOT send a second Telegram message."""
+        sent = []
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: sent.append(msg))
+        inst = _base_inst(buy_price=100.0, shares=1.0, sl_pct=5.0, sl_cool=60)
+        con = _make_sl_db()
+        # First breach — alert fires
+        check_stop_loss(inst, 90.0, con)
+        assert len(sent) == 1
+        # Second breach within cooldown — alert suppressed
+        check_stop_loss(inst, 89.0, con)
+        assert len(sent) == 1          # still 1, no new message
+
+    def test_recovery_clears_cooldown(self, monkeypatch):
+        """After position recovers, cooldown is cleared so next breach re-alerts."""
+        sent = []
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: sent.append(msg))
+        inst = _base_inst(buy_price=100.0, shares=1.0, sl_pct=5.0, sl_cool=60)
+        con = _make_sl_db()
+        # First breach
+        check_stop_loss(inst, 90.0, con)
+        assert len(sent) == 1
+        # Recovery — cooldown key should be cleared
+        check_stop_loss(inst, 100.0, con)
+        assert con.execute("SELECT value FROM meta WHERE key='stop_loss_alert:test-inst'").fetchone() is None
+        # Second breach — should alert again
+        check_stop_loss(inst, 90.0, con)
+        assert len(sent) == 2
+
+    def test_zero_shares_skips_check(self, monkeypatch):
+        """No position held — check_stop_loss must return (False, None, None)."""
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: None)
+        inst = _base_inst(buy_price=100.0, shares=0.0, sl_pct=5.0)
+        triggered, pl_pct, threshold = check_stop_loss(inst, 80.0, _make_sl_db())
+        assert triggered is False
+        assert pl_pct is None
+        assert threshold is None
+
+    def test_no_buy_price_skips_check(self, monkeypatch):
+        """No cost basis recorded — check_stop_loss must return (False, None, None)."""
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: None)
+        inst = _base_inst(shares=1.0, sl_pct=5.0)
+        inst["buy_price"] = None
+        triggered, pl_pct, threshold = check_stop_loss(inst, 80.0, _make_sl_db())
+        assert triggered is False
+        assert pl_pct is None
+
+    def test_no_stop_loss_pct_skips_check(self, monkeypatch):
+        """stop_loss_pct not configured — silently skip."""
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: None)
+        inst = _base_inst(shares=1.0)
+        del inst["stop_loss_pct"]
+        triggered, pl_pct, _ = check_stop_loss(inst, 80.0, _make_sl_db())
+        assert triggered is False
+        assert pl_pct is None
+
+    def test_telegram_message_contains_key_info(self, monkeypatch):
+        """Alert message must include price, avg cost, P/L %, and threshold."""
+        sent = []
+        monkeypatch.setattr("analyze.send_telegram_text", lambda msg: sent.append(msg))
+        inst = _base_inst(buy_price=200.0, shares=2.0, sl_pct=10.0)
+        check_stop_loss(inst, 170.0, _make_sl_db())   # −15%, well below −10%
+        assert sent
+        msg = sent[0]
+        assert "170" in msg          # current price
+        assert "200" in msg          # avg cost
+        assert "-15" in msg or "−15" in msg or "-15.00" in msg  # P/L pct
+        assert "10.0" in msg         # threshold

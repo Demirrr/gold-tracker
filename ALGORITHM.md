@@ -62,7 +62,10 @@ Maximum possible score: **9 points**.
 ### Safety rules (applied before gates)
 
 - **SELL blocked if price < buy price** — the system will never suggest selling at a loss.
+- **SELL blocked if RSI < 30 (oversold)** — selling into deeply oversold conditions is contradictory; the RSI gate suppresses the signal entirely.
+- **BUY blocked if RSI > 70 (overbought)** — buying into overbought conditions is contradictory; the RSI gate suppresses the signal entirely.
 - **BUY penalty −1 if EMA ribbon is fully bearish** — buying into a downtrend is penalised.
+- **RSI scoring penalty** — in addition to the hard gate, an oversold RSI (< 25) also subtracts 2 points from `sell_score`; a mildly oversold RSI (25–35) subtracts 1 point. Mirrors the buy_score additions already in place.
 
 ### Hard gates (applied after scoring)
 
@@ -118,6 +121,8 @@ A simpler, faster engine that runs in parallel with Confluence. It looks only at
 
 - Parameters: fast EMA = 12 bars, slow EMA = 26 bars, signal = 9 bars.
 - No scoring — it fires on a crossover alone.
+- **RSI context filter** — BUY crossovers are skipped when RSI > 70 (overbought); SELL crossovers are skipped when RSI < 30 (oversold). Prevents the fast engine from firing into RSI extremes where crossovers are usually noise.
+- **Cross-engine whiplash gate** — before the MACD engine fires, it checks whether the Confluence engine recently fired the *opposite* signal within the cooldown window. If so, the MACD signal is suppressed to avoid contradictory alerts.
 - Subject to the same cooldown, freshness check, and anti-duplicate rules as Confluence.
 - Confidence is always treated as LOW (score = 3) for position sizing purposes.
 
@@ -194,6 +199,41 @@ net_proceeds   = gross_proceeds − 1.00€ fee   ← what you receive after fee
 | `mtf_15m_bars` | 8 | 2-min bars per 15-min candle |
 | `mtf_1h_bars` | 30 | 2-min bars per 1-hour candle |
 | `alert_cooldown_minutes` | 60 | Cooldown between same-direction signals |
+| `stop_loss_pct` | 5.0 | Stop-loss threshold: alert fires when unrealised P/L < −N% |
+| `stop_loss_cooldown_minutes` | 60 | Cooldown between repeat stop-loss alerts |
+
+---
+
+## Stop-loss Monitor
+
+The stop-loss monitor runs on **every analysis cycle**, independently of the two signal engines. It is a pure risk-management check and does not produce BUY/SELL signals.
+
+### Logic
+
+```
+pl_pct = (current_price − avg_buy_price) / avg_buy_price × 100
+
+if pl_pct < −stop_loss_pct:
+    fire 🚨 STOP-LOSS ALERT via Telegram
+```
+
+### Cooldown and recovery
+
+| State | Behaviour |
+|---|---|
+| P/L below threshold, cooldown not active | Alert fires; cooldown timestamp written to `meta` table |
+| P/L below threshold, within cooldown window | Alert suppressed; logged at WARNING level |
+| P/L recovers above threshold | Cooldown key cleared from `meta`; next breach will alert again |
+
+### Guard conditions (check skipped entirely)
+
+- `shares_held = 0` — no open position
+- `buy_price` not set — no cost basis recorded
+- `stop_loss_pct` not configured in `instruments.json`
+
+### ADX calculation note
+
+ADX smoothing uses a **mean-init** Wilder average for the DX series (correct formula: `ADX[i] = (ADX[i-1] × (p−1) + DX[i]) / p`), ensuring the output is always in the 0–100 range. The TR/DM smoothing correctly uses the standard Wilder sum-init.
 
 ---
 
@@ -227,22 +267,32 @@ ORDER BY s.ts DESC;
         ▼
  fetch_ohlcv() ──── last N bars from DB
         │
-        ├──► Engine 1: Confluence ──────────────────────────────────┐
-        │      │                                                     │
+        ├──► Stop-loss monitor (check_stop_loss) ─────────────────────┐
+        │      ├── shares_held > 0 and buy_price set?                  │
+        │      ├── pl_pct < −stop_loss_pct? ─No──► clear cooldown     │
+        │      ├── Within cooldown window? ─Yes──► suppress           │
+        │      └── Alert fires → Telegram 🚨                          │
+        │                                                              │
+        ├──► Engine 1: Confluence ──────────────────────────────────┐  │
+        │      │                                                     │  │
         │      ├── Score indicators (EMA + RSI + MACD + VWAP + ATR + Volume)
-        │      ├── Apply safety rules (no loss SELL, EMA penalty)   │
-        │      ├── Score ≥ 3? ─No──► skip                          │
-        │      ├── MTF gate ──blocked?──► suppress                  │
-        │      ├── Volume gate ──blocked?──► suppress               │
-        │      ├── Freshness check ──stale?──► skip                 │
-        │      └── Cooldown active? ──yes──► skip                   │
-        │                                                            │
-        ├──► Engine 2: MACD-only ─────────────────────────────────┐ │
-        │      ├── MACD crossover? ─No──► skip                    │ │
-        │      ├── Freshness check                                 │ │
-        │      └── Cooldown active?                                │ │
-        │                                                          │ │
-        ▼                                                          ▼ ▼
+        │      ├── Apply RSI penalty (oversold → −pts from sell_score)│ │
+        │      ├── Apply safety rules (no loss SELL, EMA penalty)   │  │
+        │      ├── Score ≥ 3? ─No──► skip                          │  │
+        │      ├── RSI gate (oversold→block SELL, overbought→block BUY)│ │
+        │      ├── MTF gate ──blocked?──► suppress                  │  │
+        │      ├── Volume gate ──blocked?──► suppress               │  │
+        │      ├── Freshness check ──stale?──► skip                 │  │
+        │      └── Cooldown active? ──yes──► skip                   │  │
+        │                                                            │  │
+        ├──► Engine 2: MACD-only ─────────────────────────────────┐ │  │
+        │      ├── MACD crossover? ─No──► skip                    │ │  │
+        │      ├── RSI filter (overbought BUY / oversold SELL → skip)│ │ │
+        │      ├── Cross-engine gate (opposite confluence signal?) │ │  │
+        │      ├── Freshness check                                 │ │  │
+        │      └── Cooldown active?                                │ │  │
+        │                                                          │ │  │
+        ▼                                                          ▼ ▼  ▼
   compute_position_size()  ←──────────── signal + confidence + ATR + inst
         │
         ├── BUY:  available_eur × fraction − fee → shares

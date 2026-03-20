@@ -161,7 +161,7 @@ def compute_adx(highs, lows, closes, period=14):
         trs.append(tr)
     # Wilder smoothing (period-bar initial average, then rolling)
     def _wilder(series, p):
-        result = [sum(series[:p])]
+        result = [sum(series[:p])]   # Wilder sum-init (correct for TR/DM smoothing)
         for v in series[p:]:
             result.append(result[-1] - result[-1] / p + v)
         return result
@@ -171,7 +171,12 @@ def compute_adx(highs, lows, closes, period=14):
     pdi = [100 * p / a if a > 0 else 0.0 for p, a in zip(pdm_s, atr_s)]
     mdi = [100 * m / a if a > 0 else 0.0 for m, a in zip(mdm_s, atr_s)]
     dx  = [abs(p - m) / (p + m) * 100 if (p + m) > 0 else 0.0 for p, m in zip(pdi, mdi)]
-    adx_s = _wilder(dx, period)
+    # ADX is a smoothed *average* of DX values (0-100).  Use the correct Wilder
+    # averaging formula: ADX[i] = (ADX[i-1] * (p-1) + DX[i]) / p so the result
+    # stays in the 0-100 range (unlike the raw-sum init used for ATR/DM above).
+    adx_s = [sum(dx[:period]) / period]
+    for v in dx[period:]:
+        adx_s.append((adx_s[-1] * (period - 1) + v) / period)
     return adx_s[-1], pdi[-1], mdi[-1]
 
 
@@ -703,8 +708,11 @@ def engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=None):
             sell_score += 1; sell_reasons.append(f"RSI {rsi_val:.1f} — overbought")
         elif rsi_val < 25:
             buy_score  += 2; buy_reasons.append(f"RSI {rsi_val:.1f} — strongly oversold")
+            # Selling into deeply oversold territory is contradictory — penalise
+            sell_score  = max(0, sell_score - 2)
         elif rsi_val < 35:
             buy_score  += 1; buy_reasons.append(f"RSI {rsi_val:.1f} — oversold")
+            sell_score  = max(0, sell_score - 1)
 
     # ── RSI Divergence ────────────────────────────────────────────────────────
     if div_dir == "bearish":
@@ -782,6 +790,19 @@ def engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=None):
     else:
         return None, [], max(sell_score, buy_score), rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio, adx_val
 
+    # ── Hard gate 0: RSI oversold/overbought contradiction ────────────────────
+    # Selling into oversold (or buying into overbought) is contradictory and
+    # almost always a false signal — suppress immediately.
+    if rsi_val is not None:
+        if candidate_sig == "SELL" and rsi_val < 30:
+            logging.info("SELL suppressed by RSI gate: RSI %.1f is oversold", rsi_val)
+            return None, [f"⛔ SELL suppressed: RSI {rsi_val:.1f} oversold — selling into weakness"], \
+                   candidate_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio, adx_val
+        if candidate_sig == "BUY" and rsi_val > 70:
+            logging.info("BUY suppressed by RSI gate: RSI %.1f is overbought", rsi_val)
+            return None, [f"⛔ BUY suppressed: RSI {rsi_val:.1f} overbought — buying into strength"], \
+                   candidate_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio, adx_val
+
     # ── Hard gate 1: MTF alignment ────────────────────────────────────────────
     # Suppress if signal trades against BOTH higher timeframes (worst false signals)
     if mtf is not None:
@@ -807,15 +828,26 @@ def engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=None):
     return candidate_sig, candidate_reasons, candidate_score, rsi_val, macd_l, macd_s, vwap, atr_val, vol_ratio, adx_val
 
 
-def engine_macd_only(closes, inst):
-    """Pure MACD crossover — forward-looking, fast engine."""
+def engine_macd_only(closes, inst, rsi_val=None):
+    """Pure MACD crossover — forward-looking, fast engine.
+
+    RSI context filters are applied to avoid firing into overbought/oversold extremes:
+      - BUY crossover is skipped when RSI > 70 (overbought)
+      - SELL crossover is skipped when RSI < 30 (oversold)
+    """
     macd_l, macd_s, macd_l_prev, macd_s_prev = compute_macd(closes)
     if macd_l is None or macd_l_prev is None:
         return None, None, None, None
 
     if macd_l_prev >= macd_s_prev and macd_l < macd_s:
+        if rsi_val is not None and rsi_val < 30:
+            logging.info("MACD SELL skipped: RSI %.1f oversold — crossover likely noise", rsi_val)
+            return None, None, macd_l, macd_s
         return "SELL", f"MACD ({macd_l:.4f}) crossed below signal ({macd_s:.4f})", macd_l, macd_s
     if macd_l_prev <= macd_s_prev and macd_l > macd_s:
+        if rsi_val is not None and rsi_val > 70:
+            logging.info("MACD BUY skipped: RSI %.1f overbought — crossover likely noise", rsi_val)
+            return None, None, macd_l, macd_s
         return "BUY",  f"MACD ({macd_l:.4f}) crossed above signal ({macd_s:.4f})", macd_l, macd_s
     return None, None, macd_l, macd_s
 
@@ -1014,6 +1046,115 @@ def check_staleness(last_ts_str, inst):
     return ""
 
 
+# ── Stop-loss monitor ─────────────────────────────────────────────────────────
+
+def check_stop_loss(inst, price, con):
+    """Evaluate whether the current position has breached the stop-loss threshold.
+
+    This function is the primary risk-management safety net.  It runs on *every*
+    analysis cycle — independently of the signal engines — and fires a Telegram
+    alert when unrealised P/L falls below the configured threshold.
+
+    Logic
+    -----
+    1. Guard clauses skip the check when no position is open (shares_held = 0)
+       or when no buy_price / stop_loss_pct is configured.
+    2. Compute unrealised P/L %: ``(price - buy_price) / buy_price * 100``.
+    3. If ``pl_pct < -stop_loss_pct`` (e.g. −5%), a STOP-LOSS alert is raised.
+    4. A per-instrument cooldown key in the ``meta`` table prevents repeat Telegram
+       alerts within ``stop_loss_cooldown_minutes`` (default 60 min).
+    5. When the position recovers above the threshold the cooldown key is cleared,
+       so the alert will fire again if the position deteriorates a second time.
+
+    Config keys (instruments.json)
+    --------------------------------
+    ``stop_loss_pct``               : float  — e.g. 5.0 → alert at −5 % (default 5.0)
+    ``stop_loss_cooldown_minutes``  : int    — repeat-alert cooldown (default 60)
+
+    Parameters
+    ----------
+    inst  : dict   — instrument config dict from instruments.json
+    price : float  — latest close price
+    con   : sqlite3.Connection
+
+    Returns
+    -------
+    triggered : bool   — True if alert fired (or would fire, respecting cooldown)
+    pl_pct    : float | None  — current unrealised P/L %, or None if not applicable
+    threshold : float | None  — configured stop-loss threshold (negative), or None
+    """
+    iid        = inst["id"]
+    buy_price  = inst.get("buy_price")
+    shares     = inst.get("shares_held", 0.0)
+    sl_pct     = inst.get("stop_loss_pct")
+    sl_cool    = inst.get("stop_loss_cooldown_minutes", 60)
+    meta_key   = f"stop_loss_alert:{iid}"
+
+    # ── Guard: only meaningful when holding a position with a known cost basis
+    if not buy_price or not sl_pct or shares <= 0:
+        return False, None, None
+
+    pl_pct    = (price - buy_price) / buy_price * 100
+    threshold = -abs(sl_pct)          # always negative, e.g. −5.0
+
+    if pl_pct >= threshold:
+        # Position healthy — clear any stale cooldown so a future breach re-alerts
+        try:
+            con.execute("DELETE FROM meta WHERE key=?", (meta_key,))
+            con.commit()
+        except Exception:
+            pass
+        return False, pl_pct, threshold
+
+    # ── Threshold breached — check cooldown before alerting
+    now_utc      = datetime.now(timezone.utc)
+    last_sent_raw = _meta_value(con, meta_key)
+    if last_sent_raw:
+        last_sent_dt = datetime.fromisoformat(last_sent_raw.replace("Z", "+00:00"))
+        if (now_utc - last_sent_dt).total_seconds() / 60 < sl_cool:
+            # Still within cooldown window — breach is known, no repeat alert
+            logging.info(
+                "[%s] Stop-loss breach (%.2f%% < %.2f%%) suppressed — cooldown active",
+                iid, pl_pct, threshold,
+            )
+            return True, pl_pct, threshold
+
+    # ── Fire the alert
+    pl_eur   = (price - buy_price) * shares
+    currency = inst.get("currency", "EUR")
+    msg = (
+        f"🚨 STOP-LOSS ALERT — {inst['name']}\n"
+        f"{'─' * 36}\n"
+        f"Position has fallen below the −{sl_pct:.1f}% stop-loss threshold.\n"
+        f"\n"
+        f"📉 Current P/L : {pl_pct:+.2f}%  ({pl_eur:+.4f} {currency})\n"
+        f"   Price       : {price:.4f} {currency}\n"
+        f"   Avg cost    : {buy_price:.4f} {currency}\n"
+        f"   Shares held : {shares:.6f}\n"
+        f"   Threshold   : {threshold:.1f}%\n"
+        f"\n"
+        f"⚠️  Consider reviewing your position and cutting losses.\n"
+        f"🕐 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+    logging.warning(
+        "[%s] Stop-loss alert: P/L %.2f%% < threshold %.2f%%",
+        iid, pl_pct, threshold,
+    )
+    send_telegram_text(msg)
+
+    # Record alert timestamp to enforce cooldown
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (meta_key, now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        con.commit()
+    except Exception as exc:
+        logging.error("[%s] Failed to persist stop-loss cooldown: %s", iid, exc)
+
+    return True, pl_pct, threshold
+
+
 # ── Main per-instrument analysis ──────────────────────────────────────────────
 
 def analyse_instrument(inst, con, force=False):
@@ -1066,7 +1207,22 @@ def analyse_instrument(inst, con, force=False):
     price = closes[-1]
     pct   = ((price - buy_price) / buy_price * 100) if buy_price else None
 
+    # ── Stop-loss check (runs every cycle, independent of signal engines) ──────
+    sl_triggered, sl_pl_pct, sl_threshold = check_stop_loss(inst, price, con)
     if force:
+        sl_pct_cfg = inst.get("stop_loss_pct")
+        shares      = inst.get("shares_held", 0.0)
+        if buy_price and sl_pct_cfg and shares > 0:
+            sl_icon = "🚨" if sl_triggered else ("✅" if sl_pl_pct is not None else "ℹ️")
+            sl_line = (
+                f"  {sl_icon} Stop-loss: {sl_pl_pct:+.2f}%  "
+                f"(threshold −{sl_pct_cfg:.1f}%)"
+            ) if sl_pl_pct is not None else f"  ℹ️  Stop-loss: n/a"
+            if sl_triggered:
+                sl_line += "  ← 🔴 BREACH"
+        else:
+            sl_line = "  ℹ️  Stop-loss: not configured or no position"
+
         ema_fast_n  = inst.get("ema_fast_bars", 5)
         ema_mid_n   = inst.get("ema_mid_bars", 8)
         ef, em, es, *_ = compute_ema_ribbon(closes, ema_fast_n, ema_mid_n, ema_slow_n)
@@ -1083,6 +1239,7 @@ def analyse_instrument(inst, con, force=False):
         pct_str = f"  ({pct:+.2f}% from buy at {buy_price})" if pct is not None else "  (watch-only)"
         print(f"  Last bar:  {last_ts_str}")
         print(f"  Price:     {price:.4f} {inst['currency']}{pct_str}")
+        print(sl_line)
         print(f"")
         print(f"  ── Trend ─────────────────────────────────────────")
         ribbon_dir = "BULLISH" if (ef and ef > em > es) else ("BEARISH" if (ef and ef < em < es) else "MIXED")
@@ -1153,7 +1310,7 @@ def analyse_instrument(inst, con, force=False):
     # Run both engines
     c_sig, c_reasons, c_score, rsi_v, macd_l, macd_s, vwap_v, atr_v, vol_v, adx_v = \
         engine_confluence(ohlcv, session_ohlcv, inst, pct, mtf=mtf)
-    m_sig, m_reason, m_macd_l, m_macd_s = engine_macd_only(closes, inst)
+    m_sig, m_reason, m_macd_l, m_macd_s = engine_macd_only(closes, inst, rsi_val=rsi_v)
 
     def conf_label(score):
         if score >= 5: return "HIGH"
@@ -1209,7 +1366,25 @@ def analyse_instrument(inst, con, force=False):
 
     # MACD engine — skip entirely if no new price data since last signal
     macd_has_new = force or has_new_data_since(con, iid, "macd")
-    if m_sig and macd_has_new and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
+
+    # Cross-engine whiplash gate: if confluence recently fired the *opposite* direction,
+    # suppress the MACD signal for the same cooldown window to avoid contradictory signals.
+    macd_cross_engine_blocked = False
+    if m_sig:
+        opposite_sig = "SELL" if m_sig == "BUY" else "BUY"
+        last_conf_opposite = last_signal_ts(con, iid, "confluence", opposite_sig)
+        if last_conf_opposite:
+            opp_dt = datetime.fromisoformat(last_conf_opposite.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - opp_dt < timedelta(minutes=cooldown):
+                macd_cross_engine_blocked = True
+                logging.info(
+                    "MACD %s suppressed: confluence fired %s only %s ago (cross-engine gate)",
+                    m_sig, opposite_sig,
+                    datetime.now(timezone.utc) - opp_dt,
+                )
+
+    if m_sig and macd_has_new and not macd_cross_engine_blocked \
+            and (force or not in_cooldown(con, iid, "macd", m_sig, cooldown)):
         ef_curr, _, es_curr, *_ = compute_ema_ribbon(closes, inst.get("ema_fast_bars", 5),
                                                      inst.get("ema_mid_bars", 8), ema_slow_n)
         # MACD-only engine doesn't have a confluence score; use a default score of 3 (LOW)
@@ -1241,6 +1416,9 @@ def analyse_instrument(inst, con, force=False):
     elif force:
         if not macd_has_new:
             print(f"  ℹ️  MACD ENGINE: skipped — no new price data since last signal")
+        elif macd_cross_engine_blocked:
+            opposite_sig = "SELL" if m_sig == "BUY" else "BUY"
+            print(f"  ⛔ MACD ENGINE: {m_sig} suppressed — confluence fired {opposite_sig} recently (cross-engine gate)")
         else:
             ml, ms, _, _ = compute_macd(closes)
             print(f"  ℹ️  MACD ENGINE: no crossover"
