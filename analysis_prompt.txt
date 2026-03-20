@@ -1,0 +1,2 @@
+python scripts/export_csv.py --interval 1h
+Run the export script, then analyse the resulting CSVs in data/exports/all_1h/ — load prices.csv, signals.csv, trades.csv, and outcomes.csv. For each instrument: compute EMA5/EMA21 trend direction, RSI from 1h closes, check for stop-loss breach against current position cost basis in instruments.json, review the last 3 signals with their confidence and engine, and look at recent outcome hit-rates per engine. Then give a clear BUY, SELL, or HOLD recommendation for each instrument with concise reasoning.
