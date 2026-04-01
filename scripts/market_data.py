@@ -17,9 +17,22 @@ def _normalize_download_frame(df, ticker):
     columns = getattr(df, "columns", None)
     if getattr(columns, "nlevels", 1) == 1:
         return df
-    if ticker in columns.get_level_values(-1):
-        return df.xs(ticker, axis=1, level=-1)
-    return df.xs(columns[0][-1], axis=1, level=-1)
+    level_values = columns.get_level_values(-1)
+    if ticker in level_values:
+        try:
+            return df.xs(ticker, axis=1, level=-1)
+        except Exception:
+            pass
+    # Fallback: use the first non-empty ticker symbol found in the last level
+    for val in level_values.unique():
+        if val and val is not None:
+            try:
+                result = df.xs(val, axis=1, level=-1)
+                if not result.empty:
+                    return result
+            except Exception:
+                continue
+    return df
 
 
 def _log_fetch_error(logger, instrument_id, method, interval, attempt, exc):
@@ -59,20 +72,23 @@ def fetch_history(
             except Exception as exc:
                 _log_fetch_error(logger, instrument_id, "history", interval, attempt, exc)
 
-            try:
-                df = yf.download(
-                    ticker,
-                    period=period,
-                    interval=interval,
-                    progress=False,
-                    auto_adjust=False,
-                    threads=False,
-                )
-                df = _normalize_download_frame(df, ticker)
-                if df is not None and not df.empty:
-                    return df, interval, "download"
-            except Exception as exc:
-                _log_fetch_error(logger, instrument_id, "download", interval, attempt, exc)
+            for auto_adj in (False, True):
+                try:
+                    df = yf.download(
+                        ticker,
+                        period=period,
+                        interval=interval,
+                        progress=False,
+                        auto_adjust=auto_adj,
+                        threads=False,
+                    )
+                    df = _normalize_download_frame(df, ticker)
+                    if df is not None and not df.empty:
+                        src = "download" if not auto_adj else "download(auto_adjust)"
+                        return df, interval, src
+                except Exception as exc:
+                    _log_fetch_error(logger, instrument_id, f"download(auto_adjust={auto_adj})",
+                                     interval, attempt, exc)
 
     return None, None, None
 
