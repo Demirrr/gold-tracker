@@ -517,6 +517,10 @@ def analyse_instrument(inst, con, force=False, chart=False):
     if not crossovers:
         if force:
             print("\n  No EMA crossovers — nothing to send")
+        # In force+chart mode always send the chart so the user can see
+        # the current ribbon state even without a new crossover.
+        if force and chart:
+            _send_chart(inst, ohlcv, pair_results, rsi_val, force, signal=None)
         return
 
     engine = "ema"
@@ -553,17 +557,22 @@ def analyse_instrument(inst, con, force=False, chart=False):
     send_telegram(inst, price, pair_results, rsi_val, vol_ratio)
 
     if chart:
-        caption = (
-            f"{inst['name']} | {ribbon_summary(pair_results)} | "
-            f"RSI {rsi_val:.1f}" if rsi_val else inst["name"]
-        )
-        image_path = generate_ema_chart(inst, ohlcv, pair_results)
-        try:
-            send_telegram_photo(image_path, caption)
-            if force:
-                print(f"  Chart sent: {image_path}")
-        finally:
-            Path(image_path).unlink(missing_ok=True)
+        _send_chart(inst, ohlcv, pair_results, rsi_val, force, signal=dominant)
+
+
+def _send_chart(inst, ohlcv, pair_results, rsi_val, force, signal):
+    """Generate EMA chart and send as Telegram photo. Cleans up temp file."""
+    rsi_str = f"RSI {rsi_val:.1f}" if rsi_val is not None else ""
+    sig_str = f" | Signal: {signal}" if signal else " | No signal"
+    ribbon  = ribbon_summary(pair_results).replace("✅", "").replace("⚠️", "").strip()
+    caption = f"{inst['name']} | {ribbon}{sig_str}" + (f" | {rsi_str}" if rsi_str else "")
+    image_path = generate_ema_chart(inst, ohlcv, pair_results)
+    try:
+        send_telegram_photo(image_path, caption)
+        if force:
+            print(f"  Chart sent ({Path(image_path).stat().st_size // 1024} KB)")
+    finally:
+        Path(image_path).unlink(missing_ok=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
