@@ -75,6 +75,18 @@ A single EMA pair can produce false crossovers in choppy, sideways markets.  Sta
 - When only the fastest pair (EMA 5/8) crosses but slower pairs remain counter-trend, it is likely a short-lived pullback, not a trend change — the report makes this visible at a glance.
 - Adding EMA 34 and EMA 50 extends coverage to the **medium-term institutional timeframe**, which acts as dynamic support/resistance and is watched by larger participants.
 
+### EMA — mathematical definition
+
+An Exponential Moving Average gives more weight to recent prices than a Simple Moving Average.  For a period *n*:
+
+```
+multiplier  k  =  2 / (n + 1)
+
+EMA(today)  =  price(today) × k  +  EMA(yesterday) × (1 − k)
+```
+
+The first EMA value is seeded with a Simple Moving Average over the first *n* bars.  Because *k* is larger for smaller *n*, a short-period EMA reacts faster to price changes than a long-period one.
+
 ### EMA period reference
 
 | Period | Role | What it tells you |
@@ -86,6 +98,20 @@ A single EMA pair can produce false crossovers in choppy, sideways markets.  Sta
 | EMA 50 | Slowest | Medium-term anchor; a cross here signals a genuine trend change |
 
 > **Fibonacci connection** — 5, 8, 21, 34 are all Fibonacci numbers, a sequence widely used in technical analysis.  Many institutional participants watch these levels, which is part of why they tend to be self-fulfilling.
+
+### EMA periods are in **bars**, not minutes
+
+The numbers (5, 8, 21…) count **price bars**, not wall-clock time.  The real time span of each EMA depends on how densely yfinance returns data for that instrument:
+
+| EMA | Bars | Dense trading (2 min bars) | Sparse trading (10 min bars) |
+|-----|------|----------------------------|------------------------------|
+| EMA 5  | 5  | ~10 min  | ~50 min  |
+| EMA 8  | 8  | ~16 min  | ~1.5 h   |
+| EMA 21 | 21 | ~42 min  | ~3–4 h   |
+| EMA 34 | 34 | ~1.1 h   | ~5–6 h   |
+| EMA 50 | 50 | ~1.7 h   | ~8 h     |
+
+`collect_price.py` requests 2-minute bars and falls back to 5 m → 15 m → 1 h when Yahoo Finance does not return finer data (common for thinly traded ETFs such as SGBS).  On sparse instruments each bar represents a genuine traded price, which tends to make the EMA values more meaningful — the signal spans a longer window but contains less noise.
 
 ---
 
