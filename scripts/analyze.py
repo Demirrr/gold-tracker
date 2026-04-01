@@ -2,18 +2,14 @@
 """
 Report EMA crossovers (all configured pairs) confirmed by RSI and volume.
 
-Three EMA pairs are evaluated per instrument:
-  EMA_fast / EMA_mid
-  EMA_fast / EMA_slow
-  EMA_mid  / EMA_slow
-
 A Telegram report is sent when any pair produces a crossover.  The message
 shows the state of all pairs plus RSI(14) and current volume ratio.
 
 Usage:
-  python analyze.py                       # all instruments, respects cooldown
+  python analyze.py                        # all instruments, respects cooldown
   python analyze.py --instrument sgbs-as
-  python analyze.py --force / -f          # bypass cooldown, fetch fresh data
+  python analyze.py --force / -f           # bypass cooldown, fetch fresh data
+  python analyze.py --force --chart        # also send EMA ribbon chart image
 """
 import argparse
 import json
@@ -22,6 +18,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -260,6 +257,132 @@ def _ema_guide(periods):
     return lines
 
 
+# ── Chart generation ──────────────────────────────────────────────────────────
+
+# EMA line colours in ribbon order (fast → slow)
+_EMA_COLOURS = ["#f5a623", "#f8e71c", "#7ed321", "#4a90e2", "#9b59b6"]
+
+
+def generate_ema_chart(inst, ohlcv, pair_results):
+    """
+    Render price + EMA ribbon and mark crossover points.
+
+    Returns the path to a temporary PNG file.  The caller is responsible for
+    deleting it after use.
+    """
+    import matplotlib
+    matplotlib.use("Agg")           # headless — no display required
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    periods    = _ema_periods(inst)
+    closes     = ohlcv["closes"]
+    timestamps = ohlcv["timestamps"]
+
+    # Parse timestamps
+    dates = [datetime.fromisoformat(ts.replace("Z", "+00:00")) for ts in timestamps]
+
+    # Compute one EMA series per period
+    ema_series = {p: ema(closes, p) for p in periods}
+
+    fig, (ax_price, ax_vol) = plt.subplots(
+        2, 1, figsize=(12, 7),
+        gridspec_kw={"height_ratios": [3, 1]},
+        facecolor="#1a1a2e",
+    )
+    fig.subplots_adjust(hspace=0.08)
+
+    for ax in (ax_price, ax_vol):
+        ax.set_facecolor("#16213e")
+        ax.tick_params(colors="#aaaaaa", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#333355")
+
+    # Price line
+    ax_price.plot(dates, closes, color="#e0e0e0", linewidth=1.0,
+                  alpha=0.85, label="Price", zorder=3)
+
+    # EMA lines
+    for i, period in enumerate(periods):
+        colour = _EMA_COLOURS[i % len(_EMA_COLOURS)]
+        ax_price.plot(dates, ema_series[period], color=colour,
+                      linewidth=1.4, label=f"EMA {period}", zorder=4)
+
+    # Mark crossover points
+    for r in pair_results:
+        if not r["signal"] or r["short_val"] is None:
+            continue
+        colour = "#00ff88" if r["signal"] == "BUY" else "#ff4455"
+        marker = "^" if r["signal"] == "BUY" else "v"
+        ax_price.scatter([dates[-1]], [r["short_val"]], color=colour,
+                         marker=marker, s=90, zorder=6)
+
+    # Volume bars
+    volumes = ohlcv["volumes"]
+    lookback = inst.get("volume_lookback_bars", 20)
+    avg_vol  = sum(volumes[-lookback:]) / max(lookback, 1) if volumes else 1
+    bar_colours = ["#3a7bd5" if v <= avg_vol * inst.get("volume_spike_mult", 2.0)
+                   else "#f5a623" for v in volumes]
+    ax_vol.bar(dates, volumes, color=bar_colours, width=0.001, alpha=0.7)
+    if avg_vol:
+        ax_vol.axhline(avg_vol, color="#888888", linewidth=0.8,
+                       linestyle="--", label="Avg vol")
+
+    # Titles and labels
+    signal_tags = [r["signal"] for r in pair_results if r["signal"]]
+    dominant    = "BUY" if signal_tags.count("BUY") >= signal_tags.count("SELL") else "SELL"
+    title_colour = "#00ff88" if (not signal_tags or dominant == "BUY") else "#ff4455"
+    ribbon_label = ribbon_summary(pair_results).replace("✅", "").replace("⚠️", "").strip()
+    ax_price.set_title(
+        f"{inst['name']}  |  {ribbon_label}",
+        color=title_colour, fontsize=11, pad=8,
+    )
+    ax_price.set_ylabel("Price", color="#aaaaaa", fontsize=8)
+    ax_vol.set_ylabel("Volume", color="#aaaaaa", fontsize=8)
+
+    ax_price.xaxis.set_visible(False)
+    ax_vol.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    fig.autofmt_xdate(rotation=30, ha="right")
+
+    legend = ax_price.legend(
+        loc="upper left", fontsize=7,
+        facecolor="#1a1a2e", edgecolor="#333355", labelcolor="#cccccc",
+    )
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    fig.savefig(tmp.name, dpi=130, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logging.info("[%s] chart saved to %s", inst["id"], tmp.name)
+    return tmp.name
+
+
+def send_telegram_photo(image_path, caption):
+    """Send an image to Telegram using sendPhoto multipart upload."""
+    if not TELEGRAM_BOT_TOKEN:
+        logging.warning("TELEGRAM_BOT_TOKEN not set, skipping photo")
+        return
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not chat_id:
+        logging.warning("TELEGRAM_CHAT_ID not set, skipping photo")
+        return
+    try:
+        result = subprocess.run(
+            [
+                "curl", "--silent", "--show-error",
+                "-X", "POST",
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                "-F", f"chat_id={chat_id}",
+                "-F", f"caption={caption}",
+                "-F", f"photo=@{image_path}",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        logging.info("Telegram photo sent: %s", result.stdout[:80])
+    except subprocess.CalledProcessError as exc:
+        logging.error("Telegram photo failed: %s", exc.stderr)
+
+
 def send_telegram(inst, price, pair_results, rsi_val, vol_ratio):
     if not TELEGRAM_BOT_TOKEN:
         logging.warning("TELEGRAM_BOT_TOKEN not set, skipping")
@@ -344,7 +467,7 @@ def send_telegram(inst, price, pair_results, rsi_val, vol_ratio):
 
 # ── Main per-instrument analysis ──────────────────────────────────────────────
 
-def analyse_instrument(inst, con, force=False):
+def analyse_instrument(inst, con, force=False, chart=False):
     iid      = inst["id"]
     cooldown = inst["alert_cooldown_minutes"]
     periods  = _ema_periods(inst)
@@ -429,10 +552,23 @@ def analyse_instrument(inst, con, force=False):
 
     send_telegram(inst, price, pair_results, rsi_val, vol_ratio)
 
+    if chart:
+        caption = (
+            f"{inst['name']} | {ribbon_summary(pair_results)} | "
+            f"RSI {rsi_val:.1f}" if rsi_val else inst["name"]
+        )
+        image_path = generate_ema_chart(inst, ohlcv, pair_results)
+        try:
+            send_telegram_photo(image_path, caption)
+            if force:
+                print(f"  Chart sent: {image_path}")
+        finally:
+            Path(image_path).unlink(missing_ok=True)
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def analyse(instrument_id=None, force=False):
+def analyse(instrument_id=None, force=False, chart=False):
     init_db()
     if force:
         import collect_price
@@ -442,7 +578,7 @@ def analyse(instrument_id=None, force=False):
     con = sqlite3.connect(DB_PATH)
     try:
         for inst in instruments:
-            analyse_instrument(inst, con, force=force)
+            analyse_instrument(inst, con, force=force, chart=chart)
     finally:
         con.close()
 
@@ -452,7 +588,9 @@ if __name__ == "__main__":
     parser.add_argument("--instrument", "-i", help="Instrument ID (default: all)")
     parser.add_argument("--force", "-f", action="store_true",
                         help="Bypass cooldown, fetch fresh data, print live stats")
+    parser.add_argument("--chart", "-c", action="store_true",
+                        help="Generate EMA ribbon chart and send as Telegram photo")
     args = parser.parse_args()
     if args.force:
         print("=== Manual Analysis Run (cooldown bypassed) ===")
-    analyse(args.instrument, args.force)
+    analyse(args.instrument, args.force, args.chart)
