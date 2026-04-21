@@ -259,8 +259,11 @@ def _ema_guide(periods):
 
 # ── Chart generation ──────────────────────────────────────────────────────────
 
-# EMA line colours in ribbon order (fast → slow)
-_EMA_COLOURS = ["#f5a623", "#f8e71c", "#7ed321", "#4a90e2", "#9b59b6"]
+# EMA line colours in ribbon order (fast → slow) — 10 colours for up to 10 periods
+_EMA_COLOURS = [
+    "#ff6b6b", "#ff9f43", "#f5a623", "#f8e71c", "#7ed321",
+    "#00d2d3", "#4a90e2", "#5f27cd", "#9b59b6", "#ee5a24",
+]
 
 
 def generate_ema_chart(inst, ohlcv, pair_results):
@@ -383,7 +386,7 @@ def send_telegram_photo(image_path, caption):
         logging.error("Telegram photo failed: %s", exc.stderr)
 
 
-def send_telegram(inst, price, pair_results, rsi_val, vol_ratio, image_path=None):
+def send_telegram(inst, price, pair_results, rsi_val, vol_ratio, last_bar_ts=None):
     if not TELEGRAM_BOT_TOKEN:
         logging.warning("TELEGRAM_BOT_TOKEN not set, skipping")
         return
@@ -448,29 +451,28 @@ def send_telegram(inst, price, pair_results, rsi_val, vol_ratio, image_path=None
     else:
         lines.append(f"Price:  {price:.4f} {currency}  (watch-only)")
 
-    lines.append(f"Time:   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
-
-    core_msg = "\n".join(lines)
-
-    # Educational footer (omitted from photo captions to stay within 1024-char limit)
-    periods = _ema_periods(inst)
-    footer_lines = _ema_guide(periods)
-    full_msg = core_msg + "\n" + "\n".join(footer_lines)
-
-    if image_path:
-        # sendPhoto caption is capped at 1024 chars; use core message (no footer).
-        caption = core_msg if len(core_msg) <= 1024 else core_msg[:1021] + "…"
-        send_telegram_photo(image_path, caption)
-        logging.info("[%s] Telegram photo+report sent", inst["id"])
-    else:
+    # Timestamps — last bar (data time) + report generation time
+    if last_bar_ts:
         try:
-            env = os.environ.copy()
-            env["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
-            subprocess.run(["bash", str(TELEGRAM_SCRIPT), full_msg], env=env,
-                           check=True, capture_output=True)
-            logging.info("[%s] Telegram sent", inst["id"])
-        except subprocess.CalledProcessError as exc:
-            logging.error("[%s] Telegram failed: %s", inst["id"], exc.stderr)
+            bar_dt = datetime.fromisoformat(last_bar_ts.replace("Z", "+00:00"))
+            lines.append(f"Last bar: {bar_dt.strftime('%Y-%m-%d %H:%M')} UTC")
+        except ValueError:
+            lines.append(f"Last bar: {last_bar_ts}")
+    lines.append(f"Report:   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+
+    # Educational footer
+    periods = _ema_periods(inst)
+    lines += _ema_guide(periods)
+
+    msg = "\n".join(lines)
+    try:
+        env = os.environ.copy()
+        env["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
+        subprocess.run(["bash", str(TELEGRAM_SCRIPT), msg], env=env,
+                       check=True, capture_output=True)
+        logging.info("[%s] Telegram sent", inst["id"])
+    except subprocess.CalledProcessError as exc:
+        logging.error("[%s] Telegram failed: %s", inst["id"], exc.stderr)
 
 
 # ── Main per-instrument analysis ──────────────────────────────────────────────
@@ -525,10 +527,8 @@ def analyse_instrument(inst, con, force=False, chart=False):
     if not crossovers:
         if force:
             print("\n  No EMA crossovers — nothing to send")
-        # In force+chart mode always send the chart so the user can see
-        # the current ribbon state even without a new crossover.
         if force and chart:
-            _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, force, signal=None)
+            _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, last_ts_str, force, signal=None)
         return
 
     engine = "ema"
@@ -563,19 +563,23 @@ def analyse_instrument(inst, con, force=False, chart=False):
             print(f"     * {part}")
 
     if chart:
-        # Chart mode: single sendPhoto with full report as caption — no separate text message
-        _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, force, signal=dominant)
+        _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, last_ts_str, force, signal=dominant)
     else:
-        send_telegram(inst, price, pair_results, rsi_val, vol_ratio)
+        send_telegram(inst, price, pair_results, rsi_val, vol_ratio, last_bar_ts=last_ts_str)
 
 
-def _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, force, signal):
-    """Generate EMA chart, send it with the full report as caption, then delete the file."""
+def _send_chart(inst, ohlcv, pair_results, rsi_val, vol_ratio, price, last_bar_ts, force, signal):
+    """Send text report first, then EMA chart image. Deletes the temp file after sending."""
+    send_telegram(inst, price, pair_results, rsi_val, vol_ratio, last_bar_ts=last_bar_ts)
     image_path = generate_ema_chart(inst, ohlcv, pair_results)
     try:
-        send_telegram(inst, price, pair_results, rsi_val, vol_ratio, image_path=image_path)
+        ribbon = ribbon_summary(pair_results).replace("✅", "").replace("⚠️", "").strip()
+        sig_str = f" | {signal}" if signal else ""
+        caption = f"{inst['name']} | {ribbon}{sig_str}"
+        send_telegram_photo(image_path, caption)
         if force:
-            print(f"  Chart + report sent as photo ({Path(image_path).stat().st_size // 1024} KB) — deleted after send")
+            size_kb = Path(image_path).stat().st_size // 1024
+            print(f"  Chart sent ({size_kb} KB) — deleted after send")
     finally:
         Path(image_path).unlink(missing_ok=True)
 
